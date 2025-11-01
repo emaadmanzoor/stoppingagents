@@ -30,6 +30,4 @@ and our paper on [learning when to quit in sales conversations](https://stopping
 
 ## Acknowledgements
 
-We thank OpenAI for API credits and acknowledge financial support from
-the [Cornell Atkinson Center for Sustainability](https://www.atkinson.cornell.edu/)
-and the [U.S. National Science Foundation](https://www.nsf.gov/).
+We thank OpenAI for API credits.
