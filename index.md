@@ -18,6 +18,10 @@ Specifically, stopping agents observe the ongoing conversation text and
 make sequential `wait` or `quit` decisions that optimally tradeoff between waiting
 to accumulate more information and incurring waiting costs.
 
+This project is based on the following research:
+
+> Manzoor, Emaad, and Ascarza, Eva and Netzer, Oded. Learning When to Quit in Sales Conversations. arXiv preprint [arXiv:2511.01181](https://arxiv.org/abs/2511.01181) (2025).
+
 ![demo](images/demo.gif)
 
 <hr/>
