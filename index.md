@@ -22,6 +22,8 @@ This project is based on the following research:
 
 > Manzoor, Emaad, and Ascarza, Eva and Netzer, Oded. Learning When to Quit in Sales Conversations. arXiv preprint [arXiv:2511.01181](https://arxiv.org/abs/2511.01181) (2025).
 
+<br/>
+
 ![demo](images/demo.gif)
 
 <hr/>
