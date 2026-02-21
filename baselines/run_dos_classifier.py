@@ -171,6 +171,9 @@ with tqdm(
         if OMIT_TIME_ZERO:
             n_values = list(range(int(seq_len - 2), 0, -1))
 
+        sat_train_count_t = torch.zeros((), device=device, dtype=torch.int64)
+        sat_train_total = 0
+
         with tqdm(
             total=int(len(n_values) * DOS_EPOCHS),
             desc=f"DOS d={int(d_value)} p0={int(s0_value)}",
@@ -235,6 +238,11 @@ with tqdm(
                             values = bn(values)
                         logits = model.output_layer(values).squeeze(1)
                         phi = model.sigmoid(logits)
+
+                        sat_train_count_t += (
+                            (phi <= float(SATURATION_EPS)) | (phi >= float(1.0 - SATURATION_EPS))
+                        ).to(dtype=torch.int64).sum()
+                        sat_train_total += int(phi.numel())
 
                         delta = g_stop - g_cont
                         labels = (delta > 0.0).to(dtype=torch.float32)
@@ -322,8 +330,6 @@ with tqdm(
             t_eval_started = time.time()
             stop_idxs = torch.full((int(n_test),), int(seq_len - 1), device=device, dtype=torch.int64)
             active = torch.ones((int(n_test),), device=device, dtype=torch.bool)
-            sat_count = 0
-            sat_total = 0
 
             with torch.no_grad():
                 for n in range(int(seq_len - 1)):
@@ -342,15 +348,6 @@ with tqdm(
                             v = model.relu(v)
                             v = bn(v)
                         phi_chunk = model.sigmoid(model.output_layer(v)).squeeze(1)
-                        sat_count += int(
-                            torch.sum(
-                                (phi_chunk <= float(SATURATION_EPS))
-                                | (phi_chunk >= float(1.0 - SATURATION_EPS))
-                            )
-                            .cpu()
-                            .item()
-                        )
-                        sat_total += int(phi_chunk.numel())
                         stop_now[start:end] = phi_chunk > 0.5
 
                     stop_now = stop_now & active
@@ -360,9 +357,9 @@ with tqdm(
 
             payoff = g_test_all.gather(1, stop_idxs.view(-1, 1)).squeeze(1)
             dos_mean = float(payoff.mean().item())
-            sat_frac = float("nan")
-            if int(sat_total) > 0:
-                sat_frac = float(sat_count) / float(sat_total)
+            sat_frac_train = float("nan")
+            if int(sat_train_total) > 0:
+                sat_frac_train = float(sat_train_count_t.item()) / float(sat_train_total)
 
             t_eval_sec = time.time() - t_eval_started
 
@@ -373,20 +370,20 @@ with tqdm(
                 "d": int(d_value),
                 "p0": int(s0_value),
                 "dos_point": float(dos_mean),
-                "sat_frac_test": float(sat_frac),
+                "sat_frac_train": float(sat_frac_train),
                 "t_train_sec": float(t_train_sec),
                 "t_eval_sec": float(t_eval_sec),
             }
             results.append(row)
 
         tqdm.write(
-            f"Done DOS d={int(d_value)} p0={int(s0_value)} | mean={row['dos_point']:.3f} sat={row['sat_frac_test']:.4f}"
+            f"Done DOS d={int(d_value)} p0={int(s0_value)} | mean={row['dos_point']:.3f} sat_train={row['sat_frac_train']:.4f}"
         )
 
 results = sorted(results, key=lambda r: (int(r["d"]), int(r["p0"])))
 
 with open("baselines_dos_classifier_results.csv", "w", newline="", encoding="utf-8") as handle:
-    writer = csv.DictWriter(handle, fieldnames=["d", "p0", "DOS_classifier_point", "sat_frac_test"])
+    writer = csv.DictWriter(handle, fieldnames=["d", "p0", "DOS_classifier_point", "sat_frac_train"])
     writer.writeheader()
     for row in results:
         writer.writerow(
@@ -394,6 +391,6 @@ with open("baselines_dos_classifier_results.csv", "w", newline="", encoding="utf
                 "d": int(row["d"]),
                 "p0": int(row["p0"]),
                 "DOS_classifier_point": f'{float(row["dos_point"]):.2f}',
-                "sat_frac_test": f'{float(row["sat_frac_test"]):.6f}',
+                "sat_frac_train": f'{float(row["sat_frac_train"]):.6f}',
             }
         )
