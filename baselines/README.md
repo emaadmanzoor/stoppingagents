@@ -21,7 +21,7 @@ In addition, a script runs the *classifier-based* deep optimal stopping method p
 To run the replication scripts:
 
    1. Install dependences: ``pip install -r requirements.txt``.
-   2. Create the synthetic data: ``python generate_synthetic_data.py``.
+   2. Create the synthetic data (40,000 sequences): ``python generate_synthetic_data.py``.
    3. Run the DOS replication: ``python run_dos_replication.py``.
    4. Run the DNN-OSPG replication: ``python run_dnn_ospg_replication.py``.
    5. Run the classifier-based DOS: ``python run_dos_classifier_replication.py``.
@@ -46,6 +46,36 @@ The authors' results are from Table 1 of the [deep recurrent optimal stopping pa
 | d=200, p0=90 | 78.43 | 78.55 | 78.23 | 78.36 | 78.32 |
 | d=200, p0=100 | 96.79 | 96.78 | 96.57 | 96.52 | 96.67 |
 | d=200, p0=110 | 115.10 | 115.40 | 114.87 | 115.15 | 115.17 |
+
+## Vanishing Gradients
+
+Though the DOS and classifier DOS methods are asymptotically optimal and identical,
+their finite-sample performance may differ due to optimization challenges. In particular, the DOS method's loss is linear in the output probabilities, which can lead to vanishing gradients when the output probabilities saturate near 0 or 1. In contrast, the classifier-based DOS method's loss is logarithmic in the output probabilities, which can mitigate vanishing gradients.
+
+Concretely, write the stopping probability (the neural network output at each time period) as $\phi = F(x) = \sigma(z(x))$ and define $\Delta = g_{\text{stop}} - g_{\text{cont}}$, $y = \mathbf{1}[\Delta > 0]$, and $w = |\Delta|$. Then the per-sample gradient is:
+
+$$\nabla_\theta J_{\text{DOS}} \propto w(2y-1)\,\phi(1-\phi)\,\nabla_\theta z$$
+
+$$\nabla_\theta \mathcal{J}_{\text{CLS}} \propto w(\phi-y)\,\nabla_\theta z$$
+
+The extra $\phi(1-\phi)$ factor in DOS is the sigmoid derivative; it goes to $0$ as $\phi \to 0$ or $\phi \to 1$, attenuating the gradient even if the model is confidently wrong. For the classifier loss, this factor cancels, so the gradient does not vanish.
+
+We benchmark this empirically by tracking the fraction of $\phi$ values that saturate (i.e., $\phi \le 10^{-3}$ or $\phi \ge 1 - 10^{-3}$) during training. We find that the DOS method has a much higher fraction of saturated $\phi$ values than the classifier-based DOS method, especially for larger $d$ (hidden layer size).
+
+| (d, p0) | DOS | Classifier DOS |
+|---|---:|---:|
+| d=20, p0=90 | 49.95% | 0.30% |
+| d=20, p0=100 | 48.85% | 0.18% |
+| d=20, p0=110 | 38.83% | 0.06% |
+| d=50, p0=90 | 51.63% | 11.77% |
+| d=50, p0=100 | 52.19% | 8.95% |
+| d=50, p0=110 | 58.94% | 11.02% |
+| d=100, p0=90 | 61.43% | 25.56% |
+| d=100, p0=100 | 64.82% | 24.06% |
+| d=100, p0=110 | 61.75% | 30.23% |
+| d=200, p0=90 | 73.70% | 38.75% |
+| d=200, p0=100 | 70.21% | 35.91% |
+| d=200, p0=110 | 70.16% | 35.72% |
 
 [1]: https://jmlr.org/papers/volume20/18-232/18-232.pdf
 [2]: https://openreview.net/pdf?id=XetXfkYZ6i
