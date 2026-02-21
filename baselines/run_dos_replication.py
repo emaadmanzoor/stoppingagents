@@ -46,6 +46,7 @@ BN_EPS = 1e-3
 BN_MOMENTUM = 0.01  # PyTorch momentum = 1 - Keras momentum (0.99)
 
 OMIT_TIME_ZERO = True
+SATURATION_EPS = 1e-3  # Count phi as saturated if phi <= eps or phi >= 1-eps.
 
 device = torch.device("cuda")
 torch.set_default_dtype(torch.float32)
@@ -162,10 +163,15 @@ with tqdm(
             del val_idx_t
 
         # Models stored for inference: index by time n (0..L-2); last step is forced stop.
+        # If OMIT_TIME_ZERO is True, index 0 is left as None (we force continue at t=0).
         dos_models = [None] * (seq_len - 1)
 
+        n_values = list(range(int(seq_len - 2), -1, -1))
+        if OMIT_TIME_ZERO:
+            n_values = list(range(int(seq_len - 2), 0, -1))
+
         with tqdm(
-            total=int((seq_len - 1) * DOS_EPOCHS),
+            total=int(len(n_values) * DOS_EPOCHS),
             desc=f"DOS d={int(d_value)} p0={int(s0_value)}",
             position=1,
             leave=False,
@@ -174,7 +180,7 @@ with tqdm(
         ) as bar:
             t_train_started = time.time()
 
-            for n in range(int(seq_len - 2), -1, -1):
+            for n in n_values:
                 input_dim = int(d_in) + 1
                 hidden_dim = int(d_in) + int(UNITS_HIDDEN_OFFSET)
 
@@ -207,7 +213,6 @@ with tqdm(
 
                 optimizer = torch.optim.Adam(model.parameters(), lr=float(LR))
 
-                best_val_loss = float("inf")
                 best_val_reward_hard = -float("inf")
                 best_state = None
                 patience = 0
@@ -251,17 +256,14 @@ with tqdm(
                             v = model.relu(v)
                             v = bn(v)
                         phi_val = model.sigmoid(model.output_layer(v)).squeeze(1)
-                        val_loss_t = -(phi_val * g_stop_val + (1.0 - phi_val) * g_cont_val)
-                        val_loss = float(val_loss_t.float().mean().item())
 
                     stop_val = phi_val > 0.5
                     val_reward_hard = float(
                         torch.where(stop_val, g_stop_val, g_cont_val).float().mean().item()
                     )
-                    best_val_reward_hard = max(best_val_reward_hard, val_reward_hard)
-                    improved = val_loss < best_val_loss
+                    improved = val_reward_hard > best_val_reward_hard
                     if improved:
-                        best_val_loss = val_loss
+                        best_val_reward_hard = val_reward_hard
                         best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
                         patience = 0
                     else:
@@ -313,13 +315,13 @@ with tqdm(
             t_eval_started = time.time()
             stop_idxs = torch.full((int(n_test),), int(seq_len - 1), device=device, dtype=torch.int64)
             active = torch.ones((int(n_test),), device=device, dtype=torch.bool)
+            sat_count = 0
+            sat_total = 0
 
             with torch.no_grad():
                 for n in range(int(seq_len - 1)):
                     if OMIT_TIME_ZERO and int(n) == 0:
                         continue
-                    if not bool(torch.any(active).item()):
-                        break
                     model = dos_models[n]
                     assert model is not None
 
@@ -333,6 +335,15 @@ with tqdm(
                             v = model.relu(v)
                             v = bn(v)
                         phi_chunk = model.sigmoid(model.output_layer(v)).squeeze(1)
+                        sat_count += int(
+                            torch.sum(
+                                (phi_chunk <= float(SATURATION_EPS))
+                                | (phi_chunk >= float(1.0 - SATURATION_EPS))
+                            )
+                            .cpu()
+                            .item()
+                        )
+                        sat_total += int(phi_chunk.numel())
                         stop_now[start:end] = phi_chunk > 0.5
 
                     stop_now = stop_now & active
@@ -342,6 +353,9 @@ with tqdm(
 
             payoff = g_test_all.gather(1, stop_idxs.view(-1, 1)).squeeze(1)
             dos_mean = float(payoff.mean().item())
+            sat_frac = float("nan")
+            if int(sat_total) > 0:
+                sat_frac = float(sat_count) / float(sat_total)
 
             t_eval_sec = time.time() - t_eval_started
 
@@ -352,17 +366,20 @@ with tqdm(
                 "d": int(d_value),
                 "p0": int(s0_value),
                 "dos_point": float(dos_mean),
+                "sat_frac_test": float(sat_frac),
                 "t_train_sec": float(t_train_sec),
                 "t_eval_sec": float(t_eval_sec),
             }
             results.append(row)
 
-        tqdm.write(f"Done DOS d={int(d_value)} p0={int(s0_value)} | mean={row['dos_point']:.3f}")
+        tqdm.write(
+            f"Done DOS d={int(d_value)} p0={int(s0_value)} | mean={row['dos_point']:.3f} sat={row['sat_frac_test']:.4f}"
+        )
 
 results = sorted(results, key=lambda r: (int(r["d"]), int(r["p0"])))
 
 with open("baselines_dos_results.csv", "w", newline="", encoding="utf-8") as handle:
-    writer = csv.DictWriter(handle, fieldnames=["d", "p0", "DOS_point"])
+    writer = csv.DictWriter(handle, fieldnames=["d", "p0", "DOS_point", "sat_frac_test"])
     writer.writeheader()
     for row in results:
         writer.writerow(
@@ -370,5 +387,6 @@ with open("baselines_dos_results.csv", "w", newline="", encoding="utf-8") as han
                 "d": int(row["d"]),
                 "p0": int(row["p0"]),
                 "DOS_point": f'{float(row["dos_point"]):.2f}',
+                "sat_frac_test": f'{float(row["sat_frac_test"]):.6f}',
             }
         )
