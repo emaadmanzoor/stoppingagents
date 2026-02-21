@@ -13,9 +13,9 @@ You will need roughly 1GB of VRAM for each replication. On an NVIDIA H100 SXM GP
 
 ## Replication Results
 
-The authors' results are from Table 1 of the [deep recurrent optimal stopping paper][2]. Our results are from one run of each replication script.
+The authors' results are from Table 1 of the [deep recurrent optimal stopping paper][2]. Our results are from one run of each replication script. The authors' results are the means over 10 runs with random train-test splits.
 
-| (d, p0) | Authors' DNN-OSPG | My DNN-OSPG | Authors' DOS | My DOS |
+| (d, p0) | Authors' DNN-OSPG | Our DNN-OSPG | Authors' DOS | Our DOS |
 |---|---:|---:|---:|---:|
 | d=20, p0=90 | 37.20 | 37.22 | 37.08 | 37.11 |
 | d=20, p0=100 | 51.02 | 51.15 | 50.86 | 51.04 |
