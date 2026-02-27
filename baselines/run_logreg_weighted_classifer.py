@@ -350,3 +350,116 @@ print(f"  Status quo sales = {int(np.sum(is_sale_test))}")
 
 expected_sales_gain_pct = 100.0 * (expected_total_sales_test - status_quo_sales) / status_quo_sales
 print(f"  Expected sales gain (%): {expected_sales_gain_pct:.4f}")
+
+# ------------------------------------
+# Inductive case: n = T - 3 (t=30)
+# ------------------------------------
+n = Ts[-3]
+
+future_stops_train = yhat_train[:, -3:]
+future_stops_val = yhat_val[:, -3:]
+future_stops_test = yhat_test[:, -3:]
+
+first_j_train = future_stops_train.argmax(axis=1)
+first_j_val = future_stops_val.argmax(axis=1)
+first_j_test = future_stops_test.argmax(axis=1)
+
+start_col_train = len(Ts) + 1 - 3
+start_col_val = len(Ts) + 1 - 3
+start_col_test = len(Ts) + 1 - 3
+
+first_col_train = start_col_train + first_j_train
+first_col_val = start_col_val + first_j_val
+first_col_test = start_col_test + first_j_test
+
+g_future_stop_train = g_train_stop[np.arange(yhat_train.shape[0]), first_col_train]
+g_future_stop_val = g_val_stop[np.arange(yhat_val.shape[0]), first_col_val]
+g_future_stop_test = g_test_stop[np.arange(yhat_test.shape[0]), first_col_test]
+
+g_train_continue = np.where(duration_train >= n, g_future_stop_train, -np.inf).reshape(-1, 1)
+g_val_continue = np.where(duration_val >= n, g_future_stop_val, -np.inf).reshape(-1, 1)
+g_test_continue = np.where(duration_test >= n, g_future_stop_test, -np.inf).reshape(-1, 1)
+
+g_train_stop[:, -4] = np.where(duration_train >= n, -COST_PER_SECOND * n, -np.inf)
+g_val_stop[:, -4] = np.where(duration_val >= n, -COST_PER_SECOND * n, -np.inf)
+g_test_stop[:, -4] = np.where(duration_test >= n, -COST_PER_SECOND * n, -np.inf)
+
+mask_train = duration_train >= n
+mask_val = duration_val >= n
+mask_test = duration_test >= n
+
+X_train = embeddings_train[mask_train, :, -3]
+X_val = embeddings_val[mask_val, :, -3]
+X_test = embeddings_test[mask_test, :, -3]
+
+y_train = (g_train_stop[mask_train, -4] >= g_train_continue[mask_train, -1]).astype(int)
+y_val = (g_val_stop[mask_val, -4] >= g_val_continue[mask_val, -1]).astype(int)
+y_test = (g_test_stop[mask_test, -4] >= g_test_continue[mask_test, -1]).astype(int)
+
+w_train = g_train_stop[mask_train, -4] - g_train_continue[mask_train, -1]
+w_val = g_val_stop[mask_val, -4] - g_val_continue[mask_val, -1]
+w_test = g_test_stop[mask_test, -4] - g_test_continue[mask_test, -1]
+
+sample_weight_train = np.abs(w_train)
+sample_weight_val = np.abs(w_val)
+sample_weight_test = np.abs(w_test)
+
+assert np.unique(y_train).size == 2
+assert np.unique(y_val).size == 2
+assert np.unique(y_test).size == 2
+
+print("Fitting classifier at time T - 3...")
+X_fit = np.vstack([X_train, X_val])
+y_fit = np.concatenate([y_train, y_val])
+sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
+
+clf = LogisticRegression(
+    C=lr_c,
+    solver=lr_solver,
+    max_iter=lr_max_iter,
+    random_state=seed,
+)
+clf.fit(X_fit, y_fit, sample_weight=sample_weight_fit)
+
+p_train = clf.predict_proba(X_train)[:, 1]
+p_val = clf.predict_proba(X_val)[:, 1]
+p_test = clf.predict_proba(X_test)[:, 1]
+
+yhat_train[mask_train, -4] = (p_train >= 0.5).astype(int)
+yhat_val[mask_val, -4] = (p_val >= 0.5).astype(int)
+yhat_test[mask_test, -4] = (p_test >= 0.5).astype(int)
+
+d_test_T = duration_test[mask_test]
+
+future_stops_test = yhat_test[mask_test, -4:]
+first_j_test = future_stops_test.argmax(axis=1)
+start_col_test = len(Ts) + 1 - 4
+first_col_test = start_col_test + first_j_test
+Ts_arr = np.asarray(Ts, dtype=np.float32)
+
+stop_time_test = d_test_T.copy()
+mask_not_terminal = first_col_test < len(Ts)
+stop_time_test[mask_not_terminal] = Ts_arr[first_col_test[mask_not_terminal]]
+
+time_saved_test = np.sum(d_test_T - stop_time_test)
+print(f"  Total time saved on test (first stop >= {n}s): {time_saved_test:.2f} sec")
+
+sales_made_test = np.sum(is_sale_test[~mask_test]) + np.sum(is_sale_test[mask_test] * (first_col_test == len(Ts)))
+print(f"  Total sales made on test: {int(sales_made_test)}")
+
+expected_sales_from_time_saved_test = float(time_saved_test) * sales_per_second_test
+print(
+    "  Expected sales from time saved (same call distribution): "
+    f"{expected_sales_from_time_saved_test:.4f}"
+)
+
+expected_total_sales_test = float(sales_made_test) + expected_sales_from_time_saved_test
+print(
+    f"  Expected total sales (assuming first stop opportunity at {n}s): "
+    f"{expected_total_sales_test:.4f}"
+)
+
+print(f"  Status quo sales = {int(np.sum(is_sale_test))}")
+
+expected_sales_gain_pct = 100.0 * (expected_total_sales_test - status_quo_sales) / status_quo_sales
+print(f"  Expected sales gain (%): {expected_sales_gain_pct:.4f}")
