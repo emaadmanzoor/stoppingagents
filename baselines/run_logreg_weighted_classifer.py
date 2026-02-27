@@ -14,7 +14,7 @@ COST_PER_SECOND = 1.0 / 193.0 * 5.5 / 100.0
 BENEFIT_PER_SALE = 1.0
 
 seed = int(os.environ.get("SEED", "42"))
-embedding_dim_max = int(os.environ.get("BC_DIM_IN", "15000"))
+embedding_dim_max = int(os.environ.get("BC_DIM_IN", "1500000"))
 
 # Replication note (best benchmark seen so far; 2026-02-27):
 # - T-1 gain (first stop @ 90s): 4.2496%
@@ -30,7 +30,7 @@ embedding_dim_max = int(os.environ.get("BC_DIM_IN", "15000"))
 
 lr_solver = os.environ.get("LR_SOLVER", "lbfgs")
 lr_c = float(os.environ.get("LR_C", "20.0"))
-lr_max_iter = int(os.environ.get("LR_MAX_ITER", "1000"))
+lr_max_iter = int(os.environ.get("LR_MAX_ITER", "100000"))
 
 assert os.path.exists(CALLS_H5_PATH)
 assert os.path.exists(EMBEDDINGS_PARQUET_PATH)
@@ -199,6 +199,7 @@ sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
 clf = LogisticRegression(
     C=lr_c,
     solver=lr_solver,
+    tol=1e-24,
     max_iter=lr_max_iter,
     random_state=seed,
 )
