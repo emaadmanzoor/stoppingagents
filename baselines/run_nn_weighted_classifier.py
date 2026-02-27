@@ -5,7 +5,8 @@ import os
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from sklearn.neural_network import MLPClassifier
+import torch
+from scipy.optimize import minimize
 
 CALLS_H5_PATH = "subcorpus_train_val_test60.hd5"
 EMBEDDINGS_PARQUET_PATH = "embedding_subcorpus_train_val_test60_output.parquet"
@@ -194,20 +195,94 @@ sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
 X_fit = X_fit.astype(np.float64, copy=False)
 sample_weight_fit = sample_weight_fit.astype(np.float64, copy=False)
 
-clf = MLPClassifier(
-    hidden_layer_sizes=(),
-    activation="logistic",
-    solver=lr_solver,
-    alpha=(1.0 / lr_c),
-    max_iter=lr_max_iter,
-    random_state=seed,
-    warm_start=True,
-)
-clf.out_activation_ = "logistic"
-clf.coefs_ = [np.zeros((X_fit.shape[1], 1), dtype=X_fit.dtype)]
-clf.intercepts_ = [np.zeros((1,), dtype=X_fit.dtype)]
-clf.n_layers_ = 2
-clf.fit(X_fit, y_fit, sample_weight=sample_weight_fit)
+class _TorchMLPClassifier(torch.nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.linear = torch.nn.Linear(n_features, 1, dtype=torch.float64)
+        torch.nn.init.zeros_(self.linear.weight)
+        torch.nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x):
+        return self.linear(x).squeeze(-1)
+
+    def _loss(self, x, y, sample_weight, alpha):
+        logits = self(x).squeeze(-1)
+        sample_weight_sum = sample_weight.sum()
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits,
+            y,
+            weight=sample_weight,
+            reduction="sum",
+        )
+        l2 = (self.linear.weight * self.linear.weight).sum()
+        return (loss / sample_weight_sum) + (0.5 * alpha * l2 / sample_weight_sum)
+
+    def fit(self, x_np, y_np, sample_weight_np, solver, alpha, max_iter, random_seed):
+        torch.manual_seed(random_seed)
+        x = torch.as_tensor(np.asarray(x_np, dtype=np.float64))
+        y = torch.as_tensor(np.asarray(y_np, dtype=np.float64))
+        sample_weight = torch.as_tensor(np.asarray(sample_weight_np, dtype=np.float64))
+
+        if solver == "lbfgs":
+            def objective(theta):
+                theta_t = torch.tensor(theta, dtype=torch.float64, requires_grad=True)
+                coef = theta_t[: x.shape[1]]
+                bias = theta_t[-1]
+                logits = x @ coef + bias
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits,
+                    y,
+                    weight=sample_weight,
+                    reduction="sum",
+                )
+                sample_weight_sum = sample_weight.sum()
+                loss = (loss / sample_weight_sum) + (0.5 * alpha * (coef @ coef) / sample_weight_sum)
+                loss.backward()
+                return loss.detach().item(), theta_t.grad.detach().numpy()
+
+            init = torch.nn.utils.parameters_to_vector(self.parameters()).detach().numpy()
+            result = minimize(
+                lambda v: objective(v)[0],
+                init,
+                jac=lambda v: objective(v)[1],
+                method="L-BFGS-B",
+                options={
+                    "maxiter": max_iter,
+                    "maxls": 50,
+                    "gtol": 1e-4,
+                    "ftol": 64 * np.finfo(float).eps,
+                },
+            )
+            flat = torch.as_tensor(result.x, dtype=torch.float64)
+            torch.nn.utils.vector_to_parameters(flat, self.parameters())
+        elif solver == "adam":
+            optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+            for _ in range(int(max_iter)):
+                optimizer.zero_grad(set_to_none=True)
+                loss = self._loss(x, y, sample_weight, alpha)
+                loss.backward()
+                optimizer.step()
+        elif solver == "sgd":
+            optimizer = torch.optim.SGD(self.parameters(), lr=0.001, momentum=0.9, nesterov=True)
+            for _ in range(int(max_iter)):
+                optimizer.zero_grad(set_to_none=True)
+                loss = self._loss(x, y, sample_weight, alpha)
+                loss.backward()
+                optimizer.step()
+        else:
+            raise ValueError(f"unknown solver: {solver}")
+        return self
+
+    def predict_proba(self, x_np):
+        self.eval()
+        x = torch.as_tensor(np.asarray(x_np, dtype=np.float64))
+        with torch.no_grad():
+            p = torch.sigmoid(self(x).squeeze(-1)).cpu().numpy().astype(np.float64)
+        return np.column_stack([1.0 - p, p])
+
+
+clf = _TorchMLPClassifier(X_fit.shape[1])
+clf.fit(X_fit, y_fit, sample_weight_fit, lr_solver, (1.0 / lr_c), lr_max_iter, seed)
 
 p_train = clf.predict_proba(X_train)[:, 1]
 p_val = clf.predict_proba(X_val)[:, 1]
@@ -308,20 +383,8 @@ sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
 X_fit = X_fit.astype(np.float64, copy=False)
 sample_weight_fit = sample_weight_fit.astype(np.float64, copy=False)
 
-clf = MLPClassifier(
-    hidden_layer_sizes=(),
-    activation="logistic",
-    solver=lr_solver,
-    alpha=(1.0 / lr_c),
-    max_iter=lr_max_iter,
-    random_state=seed,
-    warm_start=True,
-)
-clf.out_activation_ = "logistic"
-clf.coefs_ = [np.zeros((X_fit.shape[1], 1), dtype=X_fit.dtype)]
-clf.intercepts_ = [np.zeros((1,), dtype=X_fit.dtype)]
-clf.n_layers_ = 2
-clf.fit(X_fit, y_fit, sample_weight=sample_weight_fit)
+clf = _TorchMLPClassifier(X_fit.shape[1])
+clf.fit(X_fit, y_fit, sample_weight_fit, lr_solver, (1.0 / lr_c), lr_max_iter, seed)
 
 p_train = clf.predict_proba(X_train)[:, 1]
 p_val = clf.predict_proba(X_val)[:, 1]
