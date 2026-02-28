@@ -304,6 +304,7 @@ sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
 clf = LogisticRegression(
     C=lr_c,
     solver=lr_solver,
+    tol=1e-24,
     max_iter=lr_max_iter,
     random_state=seed,
 )
@@ -417,6 +418,7 @@ sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
 clf = LogisticRegression(
     C=lr_c,
     solver=lr_solver,
+    tol=1e-24,
     max_iter=lr_max_iter,
     random_state=seed,
 )
