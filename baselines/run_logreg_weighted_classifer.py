@@ -16,17 +16,10 @@ BENEFIT_PER_SALE = 1.0
 seed = int(os.environ.get("SEED", "42"))
 embedding_dim_max = int(os.environ.get("BC_DIM_IN", "1500000"))
 
-# Replication note (best benchmark seen so far; 2026-02-27):
-# - T-1 gain (first stop @ 90s): 4.2496%
-# - T-2 gain (first stop @ 60s, then 90s): 10.1074%
-# Config (env vars / defaults):
-# - SEED=42
-# - BC_DIM_IN=15000  (effective dim_in=min(BC_DIM_IN, embedding_dim_available)=3072)
-# - LR_SOLVER=lbfgs
-# - LR_C=20.0
-# - LR_MAX_ITER=1000
-# Notes:
-# - Training always uses train+val ("tv").
+# LR config: dim_in=3072 solver=lbfgs C=20.0 max_iter=100000
+# T-1 Expected sales gain (%): 4.5797
+# T-2 Expected sales gain (%): 7.7825
+# T-3 Expected sales gain (%): 12.5262
 
 lr_solver = os.environ.get("LR_SOLVER", "lbfgs")
 lr_c = float(os.environ.get("LR_C", "20.0"))
