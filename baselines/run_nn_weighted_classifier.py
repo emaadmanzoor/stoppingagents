@@ -185,9 +185,9 @@ assert np.unique(y_val).size == 2
 assert np.unique(y_test).size == 2
 
 print("Fitting classifier at time T - 1...")
-X_fit = np.vstack([X_train, X_val])
-y_fit = np.concatenate([y_train, y_val])
-sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
+X_fit = X_train
+y_fit = y_train
+sample_weight_fit = sample_weight_train
 
 X_fit = X_fit.astype(np.float64, copy=False)
 sample_weight_fit = sample_weight_fit.astype(np.float64, copy=False)
@@ -332,9 +332,9 @@ assert np.unique(y_val).size == 2
 assert np.unique(y_test).size == 2
 
 print("Fitting classifier at time T - 2...")
-X_fit = np.vstack([X_train, X_val])
-y_fit = np.concatenate([y_train, y_val])
-sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
+X_fit = X_train
+y_fit = y_train
+sample_weight_fit = sample_weight_train
 
 X_fit = X_fit.astype(np.float64, copy=False)
 sample_weight_fit = sample_weight_fit.astype(np.float64, copy=False)
@@ -443,9 +443,9 @@ assert np.unique(y_val).size == 2
 assert np.unique(y_test).size == 2
 
 print("Fitting classifier at time T - 3...")
-X_fit = np.vstack([X_train, X_val])
-y_fit = np.concatenate([y_train, y_val])
-sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
+X_fit = X_train
+y_fit = y_train
+sample_weight_fit = sample_weight_train
 
 X_fit = X_fit.astype(np.float64, copy=False)
 sample_weight_fit = sample_weight_fit.astype(np.float64, copy=False)

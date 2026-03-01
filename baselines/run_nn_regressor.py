@@ -13,6 +13,9 @@ EMBEDDINGS_PARQUET_PATH = "embedding_subcorpus_train_val_test60_output.parquet"
 COST_PER_SECOND = 1.0 / 193.0 * 5.5 / 100.0
 BENEFIT_PER_SALE = 1.0
 
+BN_EPS = 1e-3
+BN_MOMENTUM = 0.01  # PyTorch momentum = 1 - Keras momentum (0.99)
+
 seed = int(os.environ.get("SEED", "42"))
 embedding_dim_max = int(os.environ.get("BC_DIM_IN", "1500000"))
 
@@ -195,16 +198,30 @@ sample_weight_fit = sample_weight_fit.astype(np.float64, copy=False)
 class _TorchMLPClassifier(torch.nn.Module):
     def __init__(self, n_features):
         super().__init__()
-        self.linear = torch.nn.Linear(n_features, 1, dtype=torch.float64)
-        torch.nn.init.zeros_(self.linear.weight)
-        torch.nn.init.zeros_(self.linear.bias)
+        self.input_bn = torch.nn.BatchNorm1d(
+            int(n_features), eps=float(BN_EPS), momentum=float(BN_MOMENTUM), dtype=torch.float64
+        )
+        self.hidden_layers = torch.nn.ModuleList()
+        self.hidden_bns = torch.nn.ModuleList()
+        self.output_layer = torch.nn.Linear(int(n_features), 1, dtype=torch.float64)
+        self.relu = torch.nn.ReLU()
+        self.sigmoid = torch.nn.Sigmoid()
+
+        with torch.no_grad():
+            torch.nn.init.xavier_uniform_(self.output_layer.weight)
+            torch.nn.init.zeros_(self.output_layer.bias)
 
     def forward(self, x):
-        return self.linear(x).squeeze(-1) 
+        values = self.input_bn(x)
+        for layer, bn in zip(self.hidden_layers, self.hidden_bns):
+            values = layer(values)
+            values = self.relu(values)
+            values = bn(values)
+        return self.output_layer(values).squeeze(-1)
 
     def _loss(self, x, y, sample_weight, alpha):
-        logits = self(x).squeeze(-1)
-        phi = torch.sigmoid(logits)
+        logits = self(x)
+        phi = self.sigmoid(logits)
         delta = sample_weight * (2 * y - 1.0)
 
         loss = -(phi * delta).mean()
@@ -216,6 +233,7 @@ class _TorchMLPClassifier(torch.nn.Module):
 
     def fit(self, x_np, y_np, sample_weight_np, alpha, max_iter, random_seed):
         torch.manual_seed(random_seed)
+        self.train()
         x = torch.as_tensor(np.asarray(x_np, dtype=np.float64))
         y = torch.as_tensor(np.asarray(y_np, dtype=np.float64))
         sample_weight = torch.as_tensor(np.asarray(sample_weight_np, dtype=np.float64))
@@ -233,7 +251,7 @@ class _TorchMLPClassifier(torch.nn.Module):
         self.eval()
         x = torch.as_tensor(np.asarray(x_np, dtype=np.float64))
         with torch.no_grad():
-            p = torch.sigmoid(self(x).squeeze(-1)).cpu().numpy().astype(np.float64)
+            p = self.sigmoid(self(x)).cpu().numpy().astype(np.float64)
         return np.column_stack([1.0 - p, p])
 
 

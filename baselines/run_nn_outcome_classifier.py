@@ -5,7 +5,8 @@ import os
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from sklearn.linear_model import Ridge
+from sklearn.metrics import roc_auc_score
+import torch
 
 CALLS_H5_PATH = "subcorpus_train_val_test60.hd5"
 EMBEDDINGS_PARQUET_PATH = "embedding_subcorpus_train_val_test60_output.parquet"
@@ -16,21 +17,14 @@ BENEFIT_PER_SALE = 1.0
 seed = int(os.environ.get("SEED", "42"))
 embedding_dim_max = int(os.environ.get("BC_DIM_IN", "1500000"))
 
-# Replication note (best benchmark seen so far; 2026-02-27):
-# - T-1 gain (first stop @ 90s): 4.2496%
-# - T-2 gain (first stop @ 60s, then 90s): 10.1074%
-# Config (env vars / defaults):
-# - SEED=42
-# - BC_DIM_IN=15000  (effective dim_in=min(BC_DIM_IN, embedding_dim_available)=3072)
-# - LR_SOLVER=auto
-# - LR_C=20.0  (Ridge uses alpha=4/LR_C)
-# - LR_MAX_ITER=1000
-# Notes:
-# - Training always uses train+val ("tv").
+# Weighted logreg replication
+# Adam with no early stopping, C=20, alpha=0.05
+# T-1 Expected sales gain (%): 4.5797                                                                                                                     
+# T-2 Expected sales gain (%): 7.8119
+# T-3 Expected sales gain (%): 12.5294
 
-lr_solver = os.environ.get("LR_SOLVER", "auto")
 lr_c = float(os.environ.get("LR_C", "20.0"))
-lr_max_iter = int(os.environ.get("LR_MAX_ITER", "100000"))
+lr_max_iter = int(os.environ.get("LR_MAX_ITER", "10000"))
 
 assert os.path.exists(CALLS_H5_PATH)
 assert os.path.exists(EMBEDDINGS_PARQUET_PATH)
@@ -87,6 +81,7 @@ embeddings = embeddings.loc[
 ]
 
 Ts = sorted(embeddings["time"].unique().tolist())  # [30, 60, 90]
+Ts_arr = np.asarray(Ts, dtype=np.float32)
 
 calls_train_ids = calls_train["conversation_id"].to_numpy()
 calls_val_ids = calls_val["conversation_id"].to_numpy()
@@ -124,8 +119,8 @@ assert embeddings_val.shape == (len(calls_val), d_in, len(Ts))
 assert embeddings_test.shape == (len(calls_test), d_in, len(Ts))
 
 print(
-    "Ridge config: "
-    f"dim_in={d_in} solver={lr_solver} alpha={4.0 / lr_c} max_iter={lr_max_iter}"
+    "LR config: "
+    f"dim_in={d_in} C={lr_c} max_iter={lr_max_iter}"
 )
 # g_stop(n, X_n^k) = cumulative reward of stopping call k at time n given state X_n^k.
 # If call k has duration < n, then g_stop(n, X_n^k) = -inf so it never wins in a max comparison.
@@ -175,39 +170,156 @@ X_train = embeddings_train[mask_train, :, -1]
 X_val = embeddings_val[mask_val, :, -1]
 X_test = embeddings_test[mask_test, :, -1]
 
-y_train = (g_train_stop[mask_train, -2] >= g_train_continue[mask_train, -1]).astype(int)
-y_val = (g_val_stop[mask_val, -2] >= g_val_continue[mask_val, -1]).astype(int)
-y_test = (g_test_stop[mask_test, -2] >= g_test_continue[mask_test, -1]).astype(int)
+y_train = is_sale_train[mask_train].astype(int)
+y_val = is_sale_val[mask_val].astype(int)
+y_test = is_sale_test[mask_test].astype(int)
 
-w_train = g_train_stop[mask_train, -2] - g_train_continue[mask_train, -1]
-w_val = g_val_stop[mask_val, -2] - g_val_continue[mask_val, -1]
-w_test = g_test_stop[mask_test, -2] - g_test_continue[mask_test, -1]
+sample_weight_train = np.ones(y_train.shape[0], dtype=np.float32)
+sample_weight_val = np.ones(y_val.shape[0], dtype=np.float32)
+sample_weight_test = np.ones(y_test.shape[0], dtype=np.float32)
 
-sample_weight_train = np.sqrt(np.abs(w_train))
-sample_weight_val = np.sqrt(np.abs(w_val))
-sample_weight_test = np.sqrt(np.abs(w_test))
+assert np.unique(y_train).size == 2
+assert np.unique(y_val).size == 2
+assert np.unique(y_test).size == 2
 
-print("Fitting regressor at time T - 1...")
-X_fit = np.vstack([X_train, X_val])
-y_fit = np.concatenate(
-    [np.sign(w_train) * np.sqrt(np.abs(w_train)), np.sign(w_val) * np.sqrt(np.abs(w_val))]
+print("Fitting classifier at time T - 1...")
+X_fit = X_train
+y_fit = y_train
+sample_weight_fit = sample_weight_train
+
+X_fit = X_fit.astype(np.float64, copy=False)
+sample_weight_fit = sample_weight_fit.astype(np.float64, copy=False)
+
+class _TorchMLPClassifier(torch.nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.linear = torch.nn.Linear(n_features, 1, dtype=torch.float64)
+        torch.nn.init.zeros_(self.linear.weight)
+        torch.nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x):
+        return self.linear(x).squeeze(-1)
+
+    def _loss(self, x, y, sample_weight, alpha):
+        logits = self(x).squeeze(-1)
+        sample_weight_sum = sample_weight.sum()
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits,
+            y,
+            weight=sample_weight,
+            reduction="sum",
+        )
+        l2 = (self.linear.weight * self.linear.weight).sum()
+        return (loss / sample_weight_sum) + (0.5 * alpha * l2 / sample_weight_sum)
+
+    def fit(self, x_np, y_np, sample_weight_np, alpha, max_iter, random_seed):
+        torch.manual_seed(random_seed)
+        x = torch.as_tensor(np.asarray(x_np, dtype=np.float64))
+        y = torch.as_tensor(np.asarray(y_np, dtype=np.float64))
+        sample_weight = torch.as_tensor(np.asarray(sample_weight_np, dtype=np.float64))
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        for _ in range(int(max_iter)):
+            optimizer.zero_grad(set_to_none=True)
+            loss = self._loss(x, y, sample_weight, alpha)
+            loss.backward()
+            optimizer.step()
+
+        return self
+
+    def predict_proba(self, x_np):
+        self.eval()
+        x = torch.as_tensor(np.asarray(x_np, dtype=np.float64))
+        with torch.no_grad():
+            p = torch.sigmoid(self(x).squeeze(-1)).cpu().numpy().astype(np.float64)
+        return np.column_stack([1.0 - p, p])
+
+
+def _print_auc(label, y_train, p_train, y_val, p_val, y_test, p_test):
+    auc_train = roc_auc_score(y_train, p_train)
+    auc_val = roc_auc_score(y_val, p_val)
+    auc_test = roc_auc_score(y_test, p_test)
+    print(
+        f"  {label} AUC train={auc_train:.4f} "
+        f"val={auc_val:.4f} test={auc_test:.4f}"
+    )
+
+
+def _tune_threshold_on_val_expected_sales_gain(
+    label,
+    p_val,
+    duration_val_masked,
+    is_sale_val_masked,
+    n,
+    continue_stop_time_val,
+    continue_terminal_val,
+    sales_per_second_val,
+    status_quo_sales_val,
+    sales_made_unmasked_val,
+):
+    stop_contrib = sales_per_second_val * (duration_val_masked - float(n))
+    continue_contrib = (
+        is_sale_val_masked * continue_terminal_val.astype(np.float64)
+        + sales_per_second_val * (duration_val_masked - continue_stop_time_val)
+    )
+
+    delta = stop_contrib - continue_contrib
+    base_expected_total = float(sales_made_unmasked_val + np.sum(continue_contrib, dtype=np.float64))
+
+    threshold = -np.inf
+    best_expected_total = base_expected_total
+    if p_val.size > 0:
+        # Stop low predicted sale probability calls first.
+        order = np.argsort(p_val, kind="mergesort")
+        p_sorted = p_val[order]
+        delta_sorted = delta[order]
+        cum_delta = np.cumsum(delta_sorted, dtype=np.float64)
+        group_ends = np.flatnonzero(np.r_[p_sorted[1:] != p_sorted[:-1], True])
+        candidate_totals = base_expected_total + cum_delta[group_ends]
+        best_idx = int(np.argmax(candidate_totals))
+        if candidate_totals[best_idx] > best_expected_total:
+            best_expected_total = float(candidate_totals[best_idx])
+            threshold = float(p_sorted[group_ends[best_idx]])
+
+    expected_sales_gain_pct = 100.0 * (best_expected_total - status_quo_sales_val) / status_quo_sales_val
+    threshold_str = "-inf" if np.isneginf(threshold) else f"{threshold:.6f}"
+    print(
+        f"  {label} tuned threshold on val={threshold_str} "
+        f"(expected sales gain={expected_sales_gain_pct:.4f}%)"
+    )
+    return threshold
+
+
+clf = _TorchMLPClassifier(X_fit.shape[1])
+clf.fit(X_fit, y_fit, sample_weight_fit, (1.0 / lr_c), lr_max_iter, seed)
+
+p_train = clf.predict_proba(X_train)[:, 1]
+p_val = clf.predict_proba(X_val)[:, 1]
+p_test = clf.predict_proba(X_test)[:, 1]
+_print_auc("T - 1", y_train, p_train, y_val, p_val, y_test, p_test)
+
+sales_per_second_val = float(np.sum(is_sale_val) / np.sum(duration_val))
+status_quo_sales_val = float(np.sum(is_sale_val))
+duration_val_masked = duration_val[mask_val].astype(np.float64, copy=False)
+is_sale_val_masked = is_sale_val[mask_val].astype(np.float64, copy=False)
+continue_stop_time_val = duration_val_masked
+continue_terminal_val = np.ones(duration_val_masked.shape[0], dtype=bool)
+threshold_t_minus_1 = _tune_threshold_on_val_expected_sales_gain(
+    "T - 1",
+    p_val,
+    duration_val_masked,
+    is_sale_val_masked,
+    n,
+    continue_stop_time_val,
+    continue_terminal_val,
+    sales_per_second_val,
+    status_quo_sales_val,
+    float(np.sum(is_sale_val[~mask_val])),
 )
-sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
 
-clf = Ridge(alpha=4.0 / lr_c, solver=lr_solver, max_iter=lr_max_iter, random_state=seed)
-clf.fit(X_fit, y_fit, sample_weight=sample_weight_fit)
-
-p_train = clf.predict(X_train)
-p_val = clf.predict(X_val)
-p_test = clf.predict(X_test)
-
-p_train = p_train * np.abs(p_train)
-p_val = p_val * np.abs(p_val)
-p_test = p_test * np.abs(p_test)
-
-yhat_train[mask_train, -2] = (p_train > 0.0).astype(int)
-yhat_val[mask_val, -2] = (p_val > 0.0).astype(int)
-yhat_test[mask_test, -2] = (p_test > 0.0).astype(int)
+yhat_train[mask_train, -2] = (p_train <= threshold_t_minus_1).astype(int)
+yhat_val[mask_val, -2] = (p_val <= threshold_t_minus_1).astype(int)
+yhat_test[mask_test, -2] = (p_test <= threshold_t_minus_1).astype(int)
 
 d_test_T = duration_test[mask_test]
 time_saved_test = np.sum((d_test_T - n) * yhat_test[mask_test, -2])
@@ -276,39 +388,56 @@ X_train = embeddings_train[mask_train, :, -2]
 X_val = embeddings_val[mask_val, :, -2]
 X_test = embeddings_test[mask_test, :, -2]
 
-y_train = (g_train_stop[mask_train, -3] >= g_train_continue[mask_train, -1]).astype(int)
-y_val = (g_val_stop[mask_val, -3] >= g_val_continue[mask_val, -1]).astype(int)
-y_test = (g_test_stop[mask_test, -3] >= g_test_continue[mask_test, -1]).astype(int)
+y_train = is_sale_train[mask_train].astype(int)
+y_val = is_sale_val[mask_val].astype(int)
+y_test = is_sale_test[mask_test].astype(int)
 
-w_train = g_train_stop[mask_train, -3] - g_train_continue[mask_train, -1]
-w_val = g_val_stop[mask_val, -3] - g_val_continue[mask_val, -1]
-w_test = g_test_stop[mask_test, -3] - g_test_continue[mask_test, -1]
+sample_weight_train = np.ones(y_train.shape[0], dtype=np.float32)
+sample_weight_val = np.ones(y_val.shape[0], dtype=np.float32)
+sample_weight_test = np.ones(y_test.shape[0], dtype=np.float32)
 
-sample_weight_train = np.sqrt(np.abs(w_train))
-sample_weight_val = np.sqrt(np.abs(w_val))
-sample_weight_test = np.sqrt(np.abs(w_test))
+assert np.unique(y_train).size == 2
+assert np.unique(y_val).size == 2
+assert np.unique(y_test).size == 2
 
-print("Fitting regressor at time T - 2...")
-X_fit = np.vstack([X_train, X_val])
-y_fit = np.concatenate(
-    [np.sign(w_train) * np.sqrt(np.abs(w_train)), np.sign(w_val) * np.sqrt(np.abs(w_val))]
+print("Fitting classifier at time T - 2...")
+X_fit = X_train
+y_fit = y_train
+sample_weight_fit = sample_weight_train
+
+X_fit = X_fit.astype(np.float64, copy=False)
+sample_weight_fit = sample_weight_fit.astype(np.float64, copy=False)
+
+clf = _TorchMLPClassifier(X_fit.shape[1])
+clf.fit(X_fit, y_fit, sample_weight_fit, (1.0 / lr_c), lr_max_iter, seed)
+
+p_train = clf.predict_proba(X_train)[:, 1]
+p_val = clf.predict_proba(X_val)[:, 1]
+p_test = clf.predict_proba(X_test)[:, 1]
+_print_auc("T - 2", y_train, p_train, y_val, p_val, y_test, p_test)
+
+duration_val_masked = duration_val[mask_val].astype(np.float64, copy=False)
+is_sale_val_masked = is_sale_val[mask_val].astype(np.float64, copy=False)
+continue_first_col_val = first_col_val[mask_val]
+continue_terminal_val = continue_first_col_val == len(Ts)
+continue_stop_time_val = duration_val_masked.copy()
+continue_stop_time_val[~continue_terminal_val] = Ts_arr[continue_first_col_val[~continue_terminal_val]]
+threshold_t_minus_2 = _tune_threshold_on_val_expected_sales_gain(
+    "T - 2",
+    p_val,
+    duration_val_masked,
+    is_sale_val_masked,
+    n,
+    continue_stop_time_val,
+    continue_terminal_val,
+    sales_per_second_val,
+    status_quo_sales_val,
+    float(np.sum(is_sale_val[~mask_val])),
 )
-sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
 
-clf = Ridge(alpha=4.0 / lr_c, solver=lr_solver, max_iter=lr_max_iter, random_state=seed)
-clf.fit(X_fit, y_fit, sample_weight=sample_weight_fit)
-
-p_train = clf.predict(X_train)
-p_val = clf.predict(X_val)
-p_test = clf.predict(X_test)
-
-p_train = p_train * np.abs(p_train)
-p_val = p_val * np.abs(p_val)
-p_test = p_test * np.abs(p_test)
-
-yhat_train[mask_train, -3] = (p_train > 0.0).astype(int)
-yhat_val[mask_val, -3] = (p_val > 0.0).astype(int)
-yhat_test[mask_test, -3] = (p_test > 0.0).astype(int)
+yhat_train[mask_train, -3] = (p_train <= threshold_t_minus_2).astype(int)
+yhat_val[mask_val, -3] = (p_val <= threshold_t_minus_2).astype(int)
+yhat_test[mask_test, -3] = (p_test <= threshold_t_minus_2).astype(int)
 
 d_test_T = duration_test[mask_test]
 
@@ -316,7 +445,6 @@ future_stops_test = yhat_test[mask_test, -3:]
 first_j_test = future_stops_test.argmax(axis=1)
 start_col_test = len(Ts) + 1 - 3
 first_col_test = start_col_test + first_j_test
-Ts_arr = np.asarray(Ts, dtype=np.float32)
 
 stop_time_test = d_test_T.copy()
 mask_not_terminal = first_col_test < len(Ts)
@@ -386,39 +514,56 @@ X_train = embeddings_train[mask_train, :, -3]
 X_val = embeddings_val[mask_val, :, -3]
 X_test = embeddings_test[mask_test, :, -3]
 
-y_train = (g_train_stop[mask_train, -4] >= g_train_continue[mask_train, -1]).astype(int)
-y_val = (g_val_stop[mask_val, -4] >= g_val_continue[mask_val, -1]).astype(int)
-y_test = (g_test_stop[mask_test, -4] >= g_test_continue[mask_test, -1]).astype(int)
+y_train = is_sale_train[mask_train].astype(int)
+y_val = is_sale_val[mask_val].astype(int)
+y_test = is_sale_test[mask_test].astype(int)
 
-w_train = g_train_stop[mask_train, -4] - g_train_continue[mask_train, -1]
-w_val = g_val_stop[mask_val, -4] - g_val_continue[mask_val, -1]
-w_test = g_test_stop[mask_test, -4] - g_test_continue[mask_test, -1]
+sample_weight_train = np.ones(y_train.shape[0], dtype=np.float32)
+sample_weight_val = np.ones(y_val.shape[0], dtype=np.float32)
+sample_weight_test = np.ones(y_test.shape[0], dtype=np.float32)
 
-sample_weight_train = np.sqrt(np.abs(w_train))
-sample_weight_val = np.sqrt(np.abs(w_val))
-sample_weight_test = np.sqrt(np.abs(w_test))
+assert np.unique(y_train).size == 2
+assert np.unique(y_val).size == 2
+assert np.unique(y_test).size == 2
 
-print("Fitting regressor at time T - 3...")
-X_fit = np.vstack([X_train, X_val])
-y_fit = np.concatenate(
-    [np.sign(w_train) * np.sqrt(np.abs(w_train)), np.sign(w_val) * np.sqrt(np.abs(w_val))]
+print("Fitting classifier at time T - 3...")
+X_fit = X_train
+y_fit = y_train
+sample_weight_fit = sample_weight_train
+
+X_fit = X_fit.astype(np.float64, copy=False)
+sample_weight_fit = sample_weight_fit.astype(np.float64, copy=False)
+
+clf = _TorchMLPClassifier(X_fit.shape[1])
+clf.fit(X_fit, y_fit, sample_weight_fit, (1.0 / lr_c), lr_max_iter, seed)
+
+p_train = clf.predict_proba(X_train)[:, 1]
+p_val = clf.predict_proba(X_val)[:, 1]
+p_test = clf.predict_proba(X_test)[:, 1]
+_print_auc("T - 3", y_train, p_train, y_val, p_val, y_test, p_test)
+
+duration_val_masked = duration_val[mask_val].astype(np.float64, copy=False)
+is_sale_val_masked = is_sale_val[mask_val].astype(np.float64, copy=False)
+continue_first_col_val = first_col_val[mask_val]
+continue_terminal_val = continue_first_col_val == len(Ts)
+continue_stop_time_val = duration_val_masked.copy()
+continue_stop_time_val[~continue_terminal_val] = Ts_arr[continue_first_col_val[~continue_terminal_val]]
+threshold_t_minus_3 = _tune_threshold_on_val_expected_sales_gain(
+    "T - 3",
+    p_val,
+    duration_val_masked,
+    is_sale_val_masked,
+    n,
+    continue_stop_time_val,
+    continue_terminal_val,
+    sales_per_second_val,
+    status_quo_sales_val,
+    float(np.sum(is_sale_val[~mask_val])),
 )
-sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val])
 
-clf = Ridge(alpha=4.0 / lr_c, solver=lr_solver, max_iter=lr_max_iter, random_state=seed)
-clf.fit(X_fit, y_fit, sample_weight=sample_weight_fit)
-
-p_train = clf.predict(X_train)
-p_val = clf.predict(X_val)
-p_test = clf.predict(X_test)
-
-p_train = p_train * np.abs(p_train)
-p_val = p_val * np.abs(p_val)
-p_test = p_test * np.abs(p_test)
-
-yhat_train[mask_train, -4] = (p_train > 0.0).astype(int)
-yhat_val[mask_val, -4] = (p_val > 0.0).astype(int)
-yhat_test[mask_test, -4] = (p_test > 0.0).astype(int)
+yhat_train[mask_train, -4] = (p_train <= threshold_t_minus_3).astype(int)
+yhat_val[mask_val, -4] = (p_val <= threshold_t_minus_3).astype(int)
+yhat_test[mask_test, -4] = (p_test <= threshold_t_minus_3).astype(int)
 
 d_test_T = duration_test[mask_test]
 
@@ -426,7 +571,6 @@ future_stops_test = yhat_test[mask_test, -4:]
 first_j_test = future_stops_test.argmax(axis=1)
 start_col_test = len(Ts) + 1 - 4
 first_col_test = start_col_test + first_j_test
-Ts_arr = np.asarray(Ts, dtype=np.float32)
 
 stop_time_test = d_test_T.copy()
 mask_not_terminal = first_col_test < len(Ts)
