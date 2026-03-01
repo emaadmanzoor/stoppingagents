@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 
-# Good run notes (2026-02-28):
+# Good run notes (2026-03-01):
+# - uses weights
+# - threshold tuned on val
+# - early stopping using eval_auc
+# BC_LLM_MAX_TOKENS=0 BC_LLM_NUM_EPOCHS=10 BC_LLM_LR=5e-5 BC_LLM_INFER_BATCH_SIZE=72 BC_LLM_GRAD_ACC=1 BC_LLM_BATCH_SIZE=64 BC_LLM_EVAL_STEPS=20 BC_LLM_EARLY_STOP_PATIENCE=5 BC_LLM_WEIGHT_DECAY=0.01 BC_LLM_MODEL_NAME=google/gemma-3-270m python run_llama_weighted_classifier.py 
 #
-# BC_LLM_MAX_TOKENS=0 BC_LLM_NUM_EPOCHS=5 BC_LLM_LR=1e-4 BC_LLM_INFER_BATCH_SIZE=72 BC_LLM_GRAD_ACC=1 BC_LLM_BATCH_SIZE=64 BC_LLM_EVAL_STEPS=10000 BC_LLM_EARLY_STOP_PATIENCE=100 BC_LLM_WEIGHT_DECAY=0.01 BC_LLM_EVAL_FRAC=0.25 python run_llama_weighted_classifier.py
 # T-1 expected sales gain = 3.3%
-# T-2 expected sales gain = 9.3%
-# T-3 expected sales gain = 15.1%
-#
-# After setting weights to correct weights: 1.8%, 6.3%, 15.1%
-# After reducing LR to 5e-5: 3.8%, 5.9%, 15.8% 
-# After increasing epochs to 10: 3.5%, 8.8%, 18.8%
+# T-2 expected sales gain = 10.2%
+# T-3 expected sales gain = 15.7%
 
 import os
 
@@ -194,11 +193,8 @@ class _WeightedYesNoTrainer(Trainer):
         next_logits = outputs.logits[:, -1, :].float()
         #top_ids = next_logits.topk(5, dim=-1).indices[0].tolist()
         #print(f"  top-5 next token IDs: {top_ids}  decoded: {[tokenizer.decode(t) for t in top_ids]}")
-        si_no_logits = torch.stack(
-            [next_logits[:, SI_TOKEN_ID], next_logits[:, NO_TOKEN_ID]],
-            dim=-1,
-        )
-        per_example_nll = torch.nn.functional.cross_entropy(si_no_logits, labels, reduction="none")
+        target_ids = torch.where(labels == 1, NO_TOKEN_ID, SI_TOKEN_ID)
+        per_example_nll = torch.nn.functional.cross_entropy(next_logits, target_ids, reduction="none")
         loss = (per_example_nll * sample_weight).sum() / max(labels.shape[0], 1)
         return (loss, outputs) if return_outputs else loss
 
@@ -356,7 +352,7 @@ training_args = TrainingArguments(
     fp16=False,
     optim="adamw_torch",
     load_best_model_at_end=True,
-    metric_for_best_model="eval_expected_gain",
+    metric_for_best_model="eval_auc",
     greater_is_better=True,
     save_only_model=True,
     report_to="none",
@@ -564,7 +560,7 @@ training_args = TrainingArguments(
     fp16=False,
     optim="adamw_torch",
     load_best_model_at_end=True,
-    metric_for_best_model="eval_expected_gain",
+    metric_for_best_model="eval_auc",
     greater_is_better=True,
     save_only_model=True,
     report_to="none",
@@ -791,7 +787,7 @@ training_args = TrainingArguments(
     fp16=False,
     optim="adamw_torch",
     load_best_model_at_end=True,
-    metric_for_best_model="eval_expected_gain",
+    metric_for_best_model="eval_auc",
     greater_is_better=True,
     save_only_model=True,
     report_to="none",
