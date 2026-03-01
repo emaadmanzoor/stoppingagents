@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 
 # Good run notes (2026-02-28):
+#
 # BC_LLM_MAX_TOKENS=0 BC_LLM_NUM_EPOCHS=5 BC_LLM_LR=1e-4 BC_LLM_INFER_BATCH_SIZE=72 BC_LLM_GRAD_ACC=1 BC_LLM_BATCH_SIZE=64 BC_LLM_EVAL_STEPS=10000 BC_LLM_EARLY_STOP_PATIENCE=100 BC_LLM_WEIGHT_DECAY=0.01 BC_LLM_EVAL_FRAC=0.25 python run_llama_weighted_classifier.py
 # T-1 expected sales gain = 3.3%
 # T-2 expected sales gain = 9.3%
 # T-3 expected sales gain = 15.1%
+#
+# After setting weights to correct weights: 1.8%, 6.3%, 15.1%
+# After reducing LR to 5e-5: 3.8%, 5.9%, 15.8% 
+# After increasing epochs to 10: 3.5%, 8.8%, 18.8%
 
 import os
 
@@ -15,8 +20,10 @@ import numpy as np
 import pandas as pd
 import torch
 from dotenv import load_dotenv
+import datasets
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from sklearn.metrics import roc_auc_score
 from transformers import DataCollatorWithPadding, EarlyStoppingCallback, Trainer, TrainingArguments
 
 CALLS_H5_PATH = "subcorpus_train_val_test60.hd5"
@@ -25,12 +32,6 @@ COST_PER_SECOND = 1.0 / 193.0 * 5.5 / 100.0
 BENEFIT_PER_SALE = 1.0
 
 seed = int(os.environ.get("SEED", "42"))
-
-# Weighted logreg replication
-# Adam with no early stopping, C=20, alpha=0.05
-# T-1 Expected sales gain (%): 4.5797                                                                                                                     
-# T-2 Expected sales gain (%): 7.8119
-# T-3 Expected sales gain (%): 12.5294
 
 model_name = os.environ.get("BC_LLM_MODEL_NAME", "google/gemma-3-270m").strip()
 checkpoint_path = os.environ.get("BC_LLM_CHECKPOINT_PATH", "").strip()
@@ -41,7 +42,7 @@ train_grad_acc_steps = int(os.environ.get("BC_LLM_GRAD_ACC", "1"))
 train_num_epochs = float(os.environ.get("BC_LLM_NUM_EPOCHS", "1"))
 train_weight_decay = float(os.environ.get("BC_LLM_WEIGHT_DECAY", "0.0"))
 train_logging_steps = int(os.environ.get("BC_LLM_LOGGING_STEPS", "10"))
-train_eval_frac = float(os.environ.get("BC_LLM_EVAL_FRAC", "0.1"))
+
 train_eval_steps = int(os.environ.get("BC_LLM_EVAL_STEPS", "100"))
 train_early_stop_patience = int(os.environ.get("BC_LLM_EARLY_STOP_PATIENCE", "3"))
 infer_batch_size = int(os.environ.get("BC_LLM_INFER_BATCH_SIZE", "64"))
@@ -54,9 +55,6 @@ calls_val = pd.read_hdf(CALLS_H5_PATH, key="val")
 calls_test = pd.read_hdf(CALLS_H5_PATH, key="test")
 
 calls_train = calls_train.loc[calls_train["transcript_speaker_30"].notna()].copy()
-calls_train = calls_train.sample(frac=1.0, random_state=seed).groupby("is_sale", group_keys=False).head(
-    int(calls_train["is_sale"].value_counts().min())
-).copy()
 calls_val = calls_val.loc[calls_val["transcript_speaker_30"].notna()].copy()
 calls_test = calls_test.loc[calls_test["transcript_speaker_30"].notna()].copy()
 
@@ -78,6 +76,7 @@ Ts_arr = np.asarray(Ts, dtype=np.float32)
 
 status_quo_sales = float(np.sum(is_sale_test))
 sales_per_second_test = float(status_quo_sales / float(np.sum(duration_test)))
+sales_per_second_val = float(np.sum(is_sale_val)) / float(np.sum(duration_val))
 
 load_dotenv()
 hf_token = os.environ.get("HF_TOKEN", "").strip() or None
@@ -148,7 +147,11 @@ def infer_phat(prompts):
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 next_logits = outputs.logits[:, -1, :].float()
 
-            phat[start:end] = torch.softmax(next_logits, dim=-1)[:, NO_TOKEN_ID].detach().cpu().numpy()
+            si_no_logits = torch.stack(
+                [next_logits[:, SI_TOKEN_ID], next_logits[:, NO_TOKEN_ID]],
+                dim=-1,
+            )
+            phat[start:end] = torch.softmax(si_no_logits, dim=-1)[:, 1].detach().cpu().numpy()
     return phat
 
 
@@ -189,14 +192,48 @@ class _WeightedYesNoTrainer(Trainer):
         except TypeError:
             outputs = model(**inputs)
         next_logits = outputs.logits[:, -1, :].float()
-        target_token_ids = torch.where(
-            labels > 0,
-            torch.full_like(labels, int(NO_TOKEN_ID)),
-            torch.full_like(labels, int(SI_TOKEN_ID)),
+        #top_ids = next_logits.topk(5, dim=-1).indices[0].tolist()
+        #print(f"  top-5 next token IDs: {top_ids}  decoded: {[tokenizer.decode(t) for t in top_ids]}")
+        si_no_logits = torch.stack(
+            [next_logits[:, SI_TOKEN_ID], next_logits[:, NO_TOKEN_ID]],
+            dim=-1,
         )
-        per_example_nll = torch.nn.functional.cross_entropy(next_logits, target_token_ids, reduction="none")
-        loss = (per_example_nll * sample_weight).sum() / sample_weight.sum().clamp_min(1e-12)
+        per_example_nll = torch.nn.functional.cross_entropy(si_no_logits, labels, reduction="none")
+        loss = (per_example_nll * sample_weight).sum() / max(labels.shape[0], 1)
         return (loss, outputs) if return_outputs else loss
+
+
+def _preprocess_logits_for_metrics(logits, labels):
+    return logits[:, -1, [SI_TOKEN_ID, NO_TOKEN_ID]]
+
+
+_eval_gain_if_stop = None  # set before each training run; must match eval dataset order
+
+
+def _compute_metrics(eval_preds):
+    logits, labels = eval_preds
+    exp_logits = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    probs = exp_logits / exp_logits.sum(axis=-1, keepdims=True)
+    ypred = probs[:, 1]
+    ytrue = labels.astype(int)
+    if len(set(ytrue)) < 2:
+        auc = 0.5
+    else:
+        auc = roc_auc_score(ytrue, ypred)
+    # Average expected gain across all unique thresholds (less overfit than max)
+    phat = np.asarray(ypred, dtype=np.float64)
+    gain = np.asarray(_eval_gain_if_stop, dtype=np.float64)
+    order = np.argsort(-phat, kind="mergesort")
+    gain_sorted = gain[order]
+    phat_sorted = phat[order]
+    cum_gain = np.cumsum(gain_sorted)
+    group_end = np.empty(phat_sorted.size, dtype=bool)
+    group_end[:-1] = phat_sorted[:-1] != phat_sorted[1:]
+    group_end[-1] = True
+    cand_gain = cum_gain[np.flatnonzero(group_end)]
+    avg_gain = float(cand_gain.mean()) if cand_gain.size > 0 else 0.0
+    return {"auc": auc, "expected_gain": avg_gain}
+
 
 # g_stop(n, X_n^k) = cumulative reward of stopping call k at time n given state X_n^k.
 # If call k has duration < n, then g_stop(n, X_n^k) = -inf so it never wins in a max comparison.
@@ -250,9 +287,9 @@ w_train = g_train_stop[mask_train, -2] - g_train_continue[mask_train, -1]
 w_val = g_val_stop[mask_val, -2] - g_val_continue[mask_val, -1]
 w_test = g_test_stop[mask_test, -2] - g_test_continue[mask_test, -1]
 
-sample_weight_train = np.ones_like(w_train, dtype=np.float64)
-sample_weight_val = np.ones_like(w_val, dtype=np.float64)
-sample_weight_test = np.ones_like(w_test, dtype=np.float64)
+sample_weight_train = np.abs(w_train)
+sample_weight_val = np.abs(w_val)
+sample_weight_test = np.abs(w_test)
 
 assert np.unique(y_train).size == 2
 assert np.unique(y_val).size == 2
@@ -270,18 +307,14 @@ prompts_train = (prefix + calls_train.loc[mask_train, col].astype(str) + suffix)
 prompts_val = (prefix + calls_val.loc[mask_val, col].astype(str) + suffix).tolist()
 prompts_test = (prefix + calls_test.loc[mask_test, col].astype(str) + suffix).tolist()
 
-print("Fine-tuning model at time T - 1...")
-prompts_fit = prompts_train + prompts_val
-y_fit = np.concatenate([y_train, y_val]).astype(np.int64, copy=False)
-sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val]).astype(
-    np.float64, copy=False
-)
+_eval_gain_if_stop = sales_per_second_val * (duration_val[mask_val] - n) - is_sale_val[mask_val]
 
+print("Fine-tuning model at time T - 1...")
 train_dataset = Dataset.from_dict(
     {
-        "prompt": prompts_fit,
-        "labels": y_fit,
-        "sample_weight": sample_weight_fit,
+        "prompt": prompts_train,
+        "labels": y_train.astype(np.int64),
+        "sample_weight": sample_weight_train.astype(np.float64),
     }
 )
 
@@ -294,11 +327,15 @@ def _tokenize_prompts(batch):
         add_special_tokens=False,
     )
 
+eval_dataset = Dataset.from_dict(
+    {
+        "prompt": prompts_val,
+        "labels": y_val.astype(np.int64),
+        "sample_weight": sample_weight_val.astype(np.float64),
+    }
+)
 train_dataset = train_dataset.map(_tokenize_prompts, batched=True, remove_columns=["prompt"])
-train_eval_frac = float(np.clip(train_eval_frac, 0.0, 0.5))
-splits = train_dataset.train_test_split(test_size=train_eval_frac, seed=seed, shuffle=True)
-train_dataset = splits["train"]
-eval_dataset = splits["test"]
+eval_dataset = eval_dataset.map(_tokenize_prompts, batched=True, remove_columns=["prompt"])
 
 training_args = TrainingArguments(
     output_dir=os.path.join(train_outdir, f"t{int(n)}"),
@@ -319,8 +356,8 @@ training_args = TrainingArguments(
     fp16=False,
     optim="adamw_torch",
     load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    greater_is_better=False,
+    metric_for_best_model="eval_expected_gain",
+    greater_is_better=True,
     save_only_model=True,
     report_to="none",
     seed=seed,
@@ -330,9 +367,11 @@ trainer = _WeightedYesNoTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset.shuffle(seed=seed),
-    eval_dataset=eval_dataset.shuffle(seed=seed),
+    eval_dataset=eval_dataset,
     processing_class=tokenizer,
     data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+    compute_metrics=_compute_metrics,
+    preprocess_logits_for_metrics=_preprocess_logits_for_metrics,
     callbacks=[EarlyStoppingCallback(early_stopping_patience=int(train_early_stop_patience))]
     if int(train_early_stop_patience) > 0
     else None,
@@ -347,17 +386,33 @@ p_train = infer_phat(prompts_train)
 p_val = infer_phat(prompts_val)
 p_test = infer_phat(prompts_test)
 
-yhat_train[mask_train, -2] = (p_train >= 0.5).astype(int)
-yhat_val[mask_val, -2] = (p_val >= 0.5).astype(int)
+print(f"  p_train: mean={p_train.mean():.4f} median={np.median(p_train):.4f} std={p_train.std():.4f} min={p_train.min():.4f} max={p_train.max():.4f}")
+print(f"  p_val:   mean={p_val.mean():.4f} median={np.median(p_val):.4f} std={p_val.std():.4f} min={p_val.min():.4f} max={p_val.max():.4f}")
+print(f"  p_test:  mean={p_test.mean():.4f} median={np.median(p_test):.4f} std={p_test.std():.4f} min={p_test.min():.4f} max={p_test.max():.4f}")
+print(f"  sales_per_second: val={sales_per_second_val:.6f} test={sales_per_second_test:.6f}")
+print(f"  sale rate (dur>={int(n)}): val={is_sale_val[mask_val].mean():.4f} ({int(is_sale_val[mask_val].sum())}/{mask_val.sum()}) test={is_sale_test[mask_test].mean():.4f} ({int(is_sale_test[mask_test].sum())}/{mask_test.sum()})")
+print(f"  AUC(phat, is_sale): val={roc_auc_score(is_sale_val[mask_val], p_val):.4f} test={roc_auc_score(is_sale_test[mask_test], p_test):.4f}")
+print(f"  AUC(phat, y_stop):  val={roc_auc_score(y_val, p_val):.4f} test={roc_auc_score(y_test, p_test):.4f}")
+
+expected_gain_if_stop_val = _eval_gain_if_stop
+val_threshold, val_threshold_gain, val_num_stops = tune_threshold_by_expected_gain(
+    p_val, expected_gain_if_stop_val
+)
+print(
+    f"  Tuned val threshold at {int(n)}s: {val_threshold} "
+    f"(stops={val_num_stops}/{p_val.size}, est_gain={val_threshold_gain:.6f})"
+)
 expected_gain_if_stop_test = sales_per_second_test * (duration_test[mask_test] - n) - is_sale_test[mask_test]
 test_threshold, test_threshold_gain, test_num_stops = tune_threshold_by_expected_gain(
     p_test, expected_gain_if_stop_test
 )
 print(
-    f"  Tuned test threshold at {int(n)}s: {test_threshold} "
+    f"  (ref) test threshold at {int(n)}s: {test_threshold} "
     f"(stops={test_num_stops}/{p_test.size}, est_gain={test_threshold_gain:.6f})"
 )
-yhat_test[mask_test, -2] = (p_test >= test_threshold).astype(int)
+yhat_train[mask_train, -2] = (p_train >= val_threshold).astype(int)
+yhat_val[mask_val, -2] = (p_val >= val_threshold).astype(int)
+yhat_test[mask_test, -2] = (p_test >= val_threshold).astype(int)
 
 d_test_T = duration_test[mask_test]
 time_saved_test = np.sum((d_test_T - n) * yhat_test[mask_test, -2])
@@ -439,9 +494,9 @@ w_train = g_train_stop[mask_train, -3] - g_train_continue[mask_train, -1]
 w_val = g_val_stop[mask_val, -3] - g_val_continue[mask_val, -1]
 w_test = g_test_stop[mask_test, -3] - g_test_continue[mask_test, -1]
 
-sample_weight_train = np.ones_like(w_train, dtype=np.float64)
-sample_weight_val = np.ones_like(w_val, dtype=np.float64)
-sample_weight_test = np.ones_like(w_test, dtype=np.float64)
+sample_weight_train = np.abs(w_train)
+sample_weight_val = np.abs(w_val)
+sample_weight_test = np.abs(w_test)
 
 assert np.unique(y_train).size == 2
 assert np.unique(y_val).size == 2
@@ -459,26 +514,36 @@ prompts_train = (prefix + calls_train.loc[mask_train, col].astype(str) + suffix)
 prompts_val = (prefix + calls_val.loc[mask_val, col].astype(str) + suffix).tolist()
 prompts_test = (prefix + calls_test.loc[mask_test, col].astype(str) + suffix).tolist()
 
-print("Fine-tuning model at time T - 2...")
-prompts_fit = prompts_train + prompts_val
-y_fit = np.concatenate([y_train, y_val]).astype(np.int64, copy=False)
-sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val]).astype(
-    np.float64, copy=False
+d_val_T = duration_val[mask_val]
+future_stops_val_base = yhat_val[mask_val, -2:]
+first_j_val_base = future_stops_val_base.argmax(axis=1)
+start_col_val_base = len(Ts) + 1 - 2
+first_col_val_base = start_col_val_base + first_j_val_base
+stop_time_val_base = d_val_T.copy()
+mask_not_terminal_base = first_col_val_base < len(Ts)
+stop_time_val_base[mask_not_terminal_base] = Ts_arr[first_col_val_base[mask_not_terminal_base]]
+_eval_gain_if_stop = sales_per_second_val * (stop_time_val_base - n) - (
+    is_sale_val[mask_val] * (first_col_val_base == len(Ts))
 )
 
+print("Fine-tuning model at time T - 2...")
 train_dataset = Dataset.from_dict(
     {
-        "prompt": prompts_fit,
-        "labels": y_fit,
-        "sample_weight": sample_weight_fit,
+        "prompt": prompts_train,
+        "labels": y_train.astype(np.int64),
+        "sample_weight": sample_weight_train.astype(np.float64),
     }
 )
 
+eval_dataset = Dataset.from_dict(
+    {
+        "prompt": prompts_val,
+        "labels": y_val.astype(np.int64),
+        "sample_weight": sample_weight_val.astype(np.float64),
+    }
+)
 train_dataset = train_dataset.map(_tokenize_prompts, batched=True, remove_columns=["prompt"])
-train_eval_frac = float(np.clip(train_eval_frac, 0.0, 0.5))
-splits = train_dataset.train_test_split(test_size=train_eval_frac, seed=seed, shuffle=True)
-train_dataset = splits["train"]
-eval_dataset = splits["test"]
+eval_dataset = eval_dataset.map(_tokenize_prompts, batched=True, remove_columns=["prompt"])
 
 training_args = TrainingArguments(
     output_dir=os.path.join(train_outdir, f"t{int(n)}"),
@@ -499,8 +564,8 @@ training_args = TrainingArguments(
     fp16=False,
     optim="adamw_torch",
     load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    greater_is_better=False,
+    metric_for_best_model="eval_expected_gain",
+    greater_is_better=True,
     save_only_model=True,
     report_to="none",
     seed=seed,
@@ -510,9 +575,11 @@ trainer = _WeightedYesNoTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset.shuffle(seed=seed),
-    eval_dataset=eval_dataset.shuffle(seed=seed),
+    eval_dataset=eval_dataset,
     processing_class=tokenizer,
     data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+    compute_metrics=_compute_metrics,
+    preprocess_logits_for_metrics=_preprocess_logits_for_metrics,
     callbacks=[EarlyStoppingCallback(early_stopping_patience=int(train_early_stop_patience))]
     if int(train_early_stop_patience) > 0
     else None,
@@ -527,27 +594,43 @@ p_train = infer_phat(prompts_train)
 p_val = infer_phat(prompts_val)
 p_test = infer_phat(prompts_test)
 
-yhat_train[mask_train, -3] = (p_train >= 0.5).astype(int)
-yhat_val[mask_val, -3] = (p_val >= 0.5).astype(int)
+print(f"  p_train: mean={p_train.mean():.4f} median={np.median(p_train):.4f} std={p_train.std():.4f} min={p_train.min():.4f} max={p_train.max():.4f}")
+print(f"  p_val:   mean={p_val.mean():.4f} median={np.median(p_val):.4f} std={p_val.std():.4f} min={p_val.min():.4f} max={p_val.max():.4f}")
+print(f"  p_test:  mean={p_test.mean():.4f} median={np.median(p_test):.4f} std={p_test.std():.4f} min={p_test.min():.4f} max={p_test.max():.4f}")
+print(f"  sales_per_second: val={sales_per_second_val:.6f} test={sales_per_second_test:.6f}")
+print(f"  sale rate (dur>={int(n)}): val={is_sale_val[mask_val].mean():.4f} ({int(is_sale_val[mask_val].sum())}/{mask_val.sum()}) test={is_sale_test[mask_test].mean():.4f} ({int(is_sale_test[mask_test].sum())}/{mask_test.sum()})")
+print(f"  AUC(phat, is_sale): val={roc_auc_score(is_sale_val[mask_val], p_val):.4f} test={roc_auc_score(is_sale_test[mask_test], p_test):.4f}")
+print(f"  AUC(phat, y_stop):  val={roc_auc_score(y_val, p_val):.4f} test={roc_auc_score(y_test, p_test):.4f}")
+
+expected_gain_if_stop_val = _eval_gain_if_stop
+val_threshold, val_threshold_gain, val_num_stops = tune_threshold_by_expected_gain(
+    p_val, expected_gain_if_stop_val
+)
+print(
+    f"  Tuned val threshold at {int(n)}s: {val_threshold} "
+    f"(stops={val_num_stops}/{p_val.size}, est_gain={val_threshold_gain:.6f})"
+)
+yhat_train[mask_train, -3] = (p_train >= val_threshold).astype(int)
+yhat_val[mask_val, -3] = (p_val >= val_threshold).astype(int)
+yhat_test[mask_test, -3] = (p_test >= val_threshold).astype(int)
 d_test_T = duration_test[mask_test]
-future_stops_test_base = yhat_test[mask_test, -2:]
-first_j_test_base = future_stops_test_base.argmax(axis=1)
-start_col_test_base = len(Ts) + 1 - 2
-first_col_test_base = start_col_test_base + first_j_test_base
-stop_time_test_base = d_test_T.copy()
-mask_not_terminal_base = first_col_test_base < len(Ts)
-stop_time_test_base[mask_not_terminal_base] = Ts_arr[first_col_test_base[mask_not_terminal_base]]
-expected_gain_if_stop_test = sales_per_second_test * (stop_time_test_base - n) - (
-    is_sale_test[mask_test] * (first_col_test_base == len(Ts))
+future_stops_test_ref = yhat_test[mask_test, -2:]
+first_j_test_ref = future_stops_test_ref.argmax(axis=1)
+start_col_test_ref = len(Ts) + 1 - 2
+first_col_test_ref = start_col_test_ref + first_j_test_ref
+stop_time_test_ref = d_test_T.copy()
+mask_not_terminal_ref = first_col_test_ref < len(Ts)
+stop_time_test_ref[mask_not_terminal_ref] = Ts_arr[first_col_test_ref[mask_not_terminal_ref]]
+expected_gain_if_stop_test = sales_per_second_test * (stop_time_test_ref - n) - (
+    is_sale_test[mask_test] * (first_col_test_ref == len(Ts))
 )
 test_threshold, test_threshold_gain, test_num_stops = tune_threshold_by_expected_gain(
     p_test, expected_gain_if_stop_test
 )
 print(
-    f"  Tuned test threshold at {int(n)}s: {test_threshold} "
+    f"  (ref) test threshold at {int(n)}s: {test_threshold} "
     f"(stops={test_num_stops}/{p_test.size}, est_gain={test_threshold_gain:.6f})"
 )
-yhat_test[mask_test, -3] = (p_test >= test_threshold).astype(int)
 
 future_stops_test = yhat_test[mask_test, -3:]
 first_j_test = future_stops_test.argmax(axis=1)
@@ -638,9 +721,9 @@ w_train = g_train_stop[mask_train, -4] - g_train_continue[mask_train, -1]
 w_val = g_val_stop[mask_val, -4] - g_val_continue[mask_val, -1]
 w_test = g_test_stop[mask_test, -4] - g_test_continue[mask_test, -1]
 
-sample_weight_train = np.ones_like(w_train, dtype=np.float64)
-sample_weight_val = np.ones_like(w_val, dtype=np.float64)
-sample_weight_test = np.ones_like(w_test, dtype=np.float64)
+sample_weight_train = np.abs(w_train)
+sample_weight_val = np.abs(w_val)
+sample_weight_test = np.abs(w_test)
 
 assert np.unique(y_train).size == 2
 assert np.unique(y_val).size == 2
@@ -658,26 +741,36 @@ prompts_train = (prefix + calls_train.loc[mask_train, col].astype(str) + suffix)
 prompts_val = (prefix + calls_val.loc[mask_val, col].astype(str) + suffix).tolist()
 prompts_test = (prefix + calls_test.loc[mask_test, col].astype(str) + suffix).tolist()
 
-print("Fine-tuning model at time T - 3...")
-prompts_fit = prompts_train + prompts_val
-y_fit = np.concatenate([y_train, y_val]).astype(np.int64, copy=False)
-sample_weight_fit = np.concatenate([sample_weight_train, sample_weight_val]).astype(
-    np.float64, copy=False
+d_val_T = duration_val[mask_val]
+future_stops_val_base = yhat_val[mask_val, -3:]
+first_j_val_base = future_stops_val_base.argmax(axis=1)
+start_col_val_base = len(Ts) + 1 - 3
+first_col_val_base = start_col_val_base + first_j_val_base
+stop_time_val_base = d_val_T.copy()
+mask_not_terminal_base = first_col_val_base < len(Ts)
+stop_time_val_base[mask_not_terminal_base] = Ts_arr[first_col_val_base[mask_not_terminal_base]]
+_eval_gain_if_stop = sales_per_second_val * (stop_time_val_base - n) - (
+    is_sale_val[mask_val] * (first_col_val_base == len(Ts))
 )
 
+print("Fine-tuning model at time T - 3...")
 train_dataset = Dataset.from_dict(
     {
-        "prompt": prompts_fit,
-        "labels": y_fit,
-        "sample_weight": sample_weight_fit,
+        "prompt": prompts_train,
+        "labels": y_train.astype(np.int64),
+        "sample_weight": sample_weight_train.astype(np.float64),
     }
 )
 
+eval_dataset = Dataset.from_dict(
+    {
+        "prompt": prompts_val,
+        "labels": y_val.astype(np.int64),
+        "sample_weight": sample_weight_val.astype(np.float64),
+    }
+)
 train_dataset = train_dataset.map(_tokenize_prompts, batched=True, remove_columns=["prompt"])
-train_eval_frac = float(np.clip(train_eval_frac, 0.0, 0.5))
-splits = train_dataset.train_test_split(test_size=train_eval_frac, seed=seed, shuffle=True)
-train_dataset = splits["train"]
-eval_dataset = splits["test"]
+eval_dataset = eval_dataset.map(_tokenize_prompts, batched=True, remove_columns=["prompt"])
 
 training_args = TrainingArguments(
     output_dir=os.path.join(train_outdir, f"t{int(n)}"),
@@ -698,8 +791,8 @@ training_args = TrainingArguments(
     fp16=False,
     optim="adamw_torch",
     load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    greater_is_better=False,
+    metric_for_best_model="eval_expected_gain",
+    greater_is_better=True,
     save_only_model=True,
     report_to="none",
     seed=seed,
@@ -709,9 +802,11 @@ trainer = _WeightedYesNoTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset.shuffle(seed=seed),
-    eval_dataset=eval_dataset.shuffle(seed=seed),
+    eval_dataset=eval_dataset,
     processing_class=tokenizer,
     data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+    compute_metrics=_compute_metrics,
+    preprocess_logits_for_metrics=_preprocess_logits_for_metrics,
     callbacks=[EarlyStoppingCallback(early_stopping_patience=int(train_early_stop_patience))]
     if int(train_early_stop_patience) > 0
     else None,
@@ -726,27 +821,44 @@ p_train = infer_phat(prompts_train)
 p_val = infer_phat(prompts_val)
 p_test = infer_phat(prompts_test)
 
-yhat_train[mask_train, -4] = (p_train >= 0.5).astype(int)
-yhat_val[mask_val, -4] = (p_val >= 0.5).astype(int)
+print(f"  p_train: mean={p_train.mean():.4f} median={np.median(p_train):.4f} std={p_train.std():.4f} min={p_train.min():.4f} max={p_train.max():.4f}")
+print(f"  p_val:   mean={p_val.mean():.4f} median={np.median(p_val):.4f} std={p_val.std():.4f} min={p_val.min():.4f} max={p_val.max():.4f}")
+print(f"  p_test:  mean={p_test.mean():.4f} median={np.median(p_test):.4f} std={p_test.std():.4f} min={p_test.min():.4f} max={p_test.max():.4f}")
+print(f"  sales_per_second: val={sales_per_second_val:.6f} test={sales_per_second_test:.6f}")
+print(f"  sale rate (dur>={int(n)}): val={is_sale_val[mask_val].mean():.4f} ({int(is_sale_val[mask_val].sum())}/{mask_val.sum()}) test={is_sale_test[mask_test].mean():.4f} ({int(is_sale_test[mask_test].sum())}/{mask_test.sum()})")
+print(f"  AUC(phat, is_sale): val={roc_auc_score(is_sale_val[mask_val], p_val):.4f} test={roc_auc_score(is_sale_test[mask_test], p_test):.4f}")
+print(f"  AUC(phat, y_stop):  val={roc_auc_score(y_val, p_val):.4f} test={roc_auc_score(y_test, p_test):.4f}")
+
+expected_gain_if_stop_val = _eval_gain_if_stop
+val_threshold, val_threshold_gain, val_num_stops = tune_threshold_by_expected_gain(
+    p_val, expected_gain_if_stop_val
+)
+print(
+    f"  Tuned val threshold at {int(n)}s: {val_threshold} "
+    f"(stops={val_num_stops}/{p_val.size}, est_gain={val_threshold_gain:.6f})"
+)
+yhat_train[mask_train, -4] = (p_train >= val_threshold).astype(int)
+yhat_val[mask_val, -4] = (p_val >= val_threshold).astype(int)
+yhat_test[mask_test, -4] = (p_test >= val_threshold).astype(int)
+
 d_test_T = duration_test[mask_test]
-future_stops_test_base = yhat_test[mask_test, -3:]
-first_j_test_base = future_stops_test_base.argmax(axis=1)
-start_col_test_base = len(Ts) + 1 - 3
-first_col_test_base = start_col_test_base + first_j_test_base
-stop_time_test_base = d_test_T.copy()
-mask_not_terminal_base = first_col_test_base < len(Ts)
-stop_time_test_base[mask_not_terminal_base] = Ts_arr[first_col_test_base[mask_not_terminal_base]]
-expected_gain_if_stop_test = sales_per_second_test * (stop_time_test_base - n) - (
-    is_sale_test[mask_test] * (first_col_test_base == len(Ts))
+future_stops_test_ref = yhat_test[mask_test, -3:]
+first_j_test_ref = future_stops_test_ref.argmax(axis=1)
+start_col_test_ref = len(Ts) + 1 - 3
+first_col_test_ref = start_col_test_ref + first_j_test_ref
+stop_time_test_ref = d_test_T.copy()
+mask_not_terminal_ref = first_col_test_ref < len(Ts)
+stop_time_test_ref[mask_not_terminal_ref] = Ts_arr[first_col_test_ref[mask_not_terminal_ref]]
+expected_gain_if_stop_test = sales_per_second_test * (stop_time_test_ref - n) - (
+    is_sale_test[mask_test] * (first_col_test_ref == len(Ts))
 )
 test_threshold, test_threshold_gain, test_num_stops = tune_threshold_by_expected_gain(
     p_test, expected_gain_if_stop_test
 )
 print(
-    f"  Tuned test threshold at {int(n)}s: {test_threshold} "
+    f"  (ref) test threshold at {int(n)}s: {test_threshold} "
     f"(stops={test_num_stops}/{p_test.size}, est_gain={test_threshold_gain:.6f})"
 )
-yhat_test[mask_test, -4] = (p_test >= test_threshold).astype(int)
 
 future_stops_test = yhat_test[mask_test, -4:]
 first_j_test = future_stops_test.argmax(axis=1)
