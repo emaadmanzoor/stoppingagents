@@ -167,8 +167,6 @@ def _tune_threshold_on_val_expected_sales_gain(
         f"(expected sales gain={expected_sales_gain_pct:.4f}%)"
     )
     return threshold
-
-
 # g_stop(n, X_n^k) = cumulative reward of stopping call k at time n given state X_n^k.
 # If call k has duration < n, then g_stop(n, X_n^k) = -inf so it never wins in a max comparison.
 
@@ -220,13 +218,29 @@ X_train = embeddings_train[mask_train, :, -1]
 X_val = embeddings_val[mask_val, :, -1]
 X_test = embeddings_test[mask_test, :, -1]
 
-y_train = (g_train_stop[mask_train, -2] >= g_train_continue[mask_train, -1]).astype(int)
-y_val = (g_val_stop[mask_val, -2] >= g_val_continue[mask_val, -1]).astype(int)
-y_test = (g_test_stop[mask_test, -2] >= g_test_continue[mask_test, -1]).astype(int)
+y_train = (g_train_stop[mask_train, -2] >= g_train_stop[mask_train, -1]).astype(int)
+y_val = (g_val_stop[mask_val, -2] >= g_val_stop[mask_val, -1]).astype(int)
+y_test = (g_test_stop[mask_test, -2] >= g_test_stop[mask_test, -1]).astype(int)
 
-w_train = g_train_stop[mask_train, -2] - g_train_continue[mask_train, -1]
-w_val = g_val_stop[mask_val, -2] - g_val_continue[mask_val, -1]
-w_test = g_test_stop[mask_test, -2] - g_test_continue[mask_test, -1]
+w_train = g_train_stop[mask_train, -2] - g_train_stop[mask_train, -1]
+w_val = g_val_stop[mask_val, -2] - g_val_stop[mask_val, -1]
+w_test = g_test_stop[mask_test, -2] - g_test_stop[mask_test, -1]
+
+assert np.allclose(
+    w_train,
+    (-float(n) * COST_PER_SECOND)
+    - (BENEFIT_PER_SALE * is_sale_train[mask_train] - duration_train[mask_train] * COST_PER_SECOND),
+)
+assert np.allclose(
+    w_val,
+    (-float(n) * COST_PER_SECOND)
+    - (BENEFIT_PER_SALE * is_sale_val[mask_val] - duration_val[mask_val] * COST_PER_SECOND),
+)
+assert np.allclose(
+    w_test,
+    (-float(n) * COST_PER_SECOND)
+    - (BENEFIT_PER_SALE * is_sale_test[mask_test] - duration_test[mask_test] * COST_PER_SECOND),
+)
 
 sample_weight_train = np.abs(w_train)
 sample_weight_val = np.abs(w_val)
@@ -339,13 +353,29 @@ X_train = embeddings_train[mask_train, :, -2]
 X_val = embeddings_val[mask_val, :, -2]
 X_test = embeddings_test[mask_test, :, -2]
 
-y_train = (g_train_stop[mask_train, -3] >= g_train_continue[mask_train, -1]).astype(int)
-y_val = (g_val_stop[mask_val, -3] >= g_val_continue[mask_val, -1]).astype(int)
-y_test = (g_test_stop[mask_test, -3] >= g_test_continue[mask_test, -1]).astype(int)
+y_train = (g_train_stop[mask_train, -3] >= g_train_stop[mask_train, -1]).astype(int)
+y_val = (g_val_stop[mask_val, -3] >= g_val_stop[mask_val, -1]).astype(int)
+y_test = (g_test_stop[mask_test, -3] >= g_test_stop[mask_test, -1]).astype(int)
 
-w_train = g_train_stop[mask_train, -3] - g_train_continue[mask_train, -1]
-w_val = g_val_stop[mask_val, -3] - g_val_continue[mask_val, -1]
-w_test = g_test_stop[mask_test, -3] - g_test_continue[mask_test, -1]
+w_train = g_train_stop[mask_train, -3] - g_train_stop[mask_train, -1]
+w_val = g_val_stop[mask_val, -3] - g_val_stop[mask_val, -1]
+w_test = g_test_stop[mask_test, -3] - g_test_stop[mask_test, -1]
+
+assert np.allclose(
+    w_train,
+    (-float(n) * COST_PER_SECOND)
+    - (BENEFIT_PER_SALE * is_sale_train[mask_train] - duration_train[mask_train] * COST_PER_SECOND),
+)
+assert np.allclose(
+    w_val,
+    (-float(n) * COST_PER_SECOND)
+    - (BENEFIT_PER_SALE * is_sale_val[mask_val] - duration_val[mask_val] * COST_PER_SECOND),
+)
+assert np.allclose(
+    w_test,
+    (-float(n) * COST_PER_SECOND)
+    - (BENEFIT_PER_SALE * is_sale_test[mask_test] - duration_test[mask_test] * COST_PER_SECOND),
+)
 
 sample_weight_train = np.abs(w_train)
 sample_weight_val = np.abs(w_val)
@@ -471,13 +501,29 @@ X_train = embeddings_train[mask_train, :, -3]
 X_val = embeddings_val[mask_val, :, -3]
 X_test = embeddings_test[mask_test, :, -3]
 
-y_train = (g_train_stop[mask_train, -4] >= g_train_continue[mask_train, -1]).astype(int)
-y_val = (g_val_stop[mask_val, -4] >= g_val_continue[mask_val, -1]).astype(int)
-y_test = (g_test_stop[mask_test, -4] >= g_test_continue[mask_test, -1]).astype(int)
+y_train = (g_train_stop[mask_train, -4] >= g_train_stop[mask_train, -1]).astype(int)
+y_val = (g_val_stop[mask_val, -4] >= g_val_stop[mask_val, -1]).astype(int)
+y_test = (g_test_stop[mask_test, -4] >= g_test_stop[mask_test, -1]).astype(int)
 
-w_train = g_train_stop[mask_train, -4] - g_train_continue[mask_train, -1]
-w_val = g_val_stop[mask_val, -4] - g_val_continue[mask_val, -1]
-w_test = g_test_stop[mask_test, -4] - g_test_continue[mask_test, -1]
+w_train = g_train_stop[mask_train, -4] - g_train_stop[mask_train, -1]
+w_val = g_val_stop[mask_val, -4] - g_val_stop[mask_val, -1]
+w_test = g_test_stop[mask_test, -4] - g_test_stop[mask_test, -1]
+
+assert np.allclose(
+    w_train,
+    (-float(n) * COST_PER_SECOND)
+    - (BENEFIT_PER_SALE * is_sale_train[mask_train] - duration_train[mask_train] * COST_PER_SECOND),
+)
+assert np.allclose(
+    w_val,
+    (-float(n) * COST_PER_SECOND)
+    - (BENEFIT_PER_SALE * is_sale_val[mask_val] - duration_val[mask_val] * COST_PER_SECOND),
+)
+assert np.allclose(
+    w_test,
+    (-float(n) * COST_PER_SECOND)
+    - (BENEFIT_PER_SALE * is_sale_test[mask_test] - duration_test[mask_test] * COST_PER_SECOND),
+)
 
 sample_weight_train = np.abs(w_train)
 sample_weight_val = np.abs(w_val)
