@@ -20,9 +20,6 @@ seed = int(os.environ.get("SEED", "42"))
 embedding_dim_max = int(os.environ.get("BC_DIM_IN", "1500000"))
 
 # LR config: dim_in=3072 solver=lbfgs C=20.0 max_iter=100000
-# T-1 Expected sales gain (%): 4.5797
-# T-2 Expected sales gain (%): 7.7825
-# T-3 Expected sales gain (%): 12.5262
 
 lr_solver = os.environ.get("LR_SOLVER", "lbfgs")
 lr_c = float(os.environ.get("LR_C", "20.0"))
@@ -126,45 +123,65 @@ print(
 )
 
 
-def _tune_threshold_on_val_expected_sales_gain(
+def _tune_threshold_on_val_total_return(
     label,
     p_val,
-    duration_val_masked,
-    is_sale_val_masked,
-    n,
-    continue_stop_time_val,
-    continue_terminal_val,
-    sales_per_second_val,
-    status_quo_sales_val,
-    sales_made_unmasked_val,
+    g_val_stop,
+    yhat_val,
+    mask_val,
+    stop_col,
 ):
-    stop_contrib = sales_per_second_val * (duration_val_masked - float(n))
-    continue_contrib = (
-        is_sale_val_masked * continue_terminal_val.astype(np.float64)
-        + sales_per_second_val * (duration_val_masked - continue_stop_time_val)
+    # For a given threshold rho, the induced stopping time for call k is:
+    #   tau^k(rho) = n            if p_val^k >= rho
+    #             = tau_cont^k    otherwise
+    # where tau_cont^k is the downstream stopping time implied by already-set yhat
+    # decisions at later times. This tunes rho to maximize sum_k g(tau^k(rho), X_{tau^k(rho)}^k)
+    # on the validation set using the precomputed stopping values in g_val_stop.
+    stop_col = int(stop_col) % int(g_val_stop.shape[1])
+    assert p_val.shape[0] == int(mask_val.sum())
+
+    future_stops_val = yhat_val[mask_val, stop_col + 1 :]
+    assert future_stops_val.shape[1] >= 1  # must include terminal stop column
+    first_future_j_val = future_stops_val.argmax(axis=1)
+    tau_cont_col_val = (stop_col + 1) + first_future_j_val
+
+    g_stop_now_val = g_val_stop[mask_val, stop_col].astype(np.float64, copy=False)
+    g_continue_val = g_val_stop[mask_val, tau_cont_col_val].astype(np.float64, copy=False)
+
+    delta = g_stop_now_val - g_continue_val
+    base_total_g = float(
+        np.sum(g_val_stop[~mask_val, -1], dtype=np.float64)
+        + np.sum(g_continue_val, dtype=np.float64)
     )
-    delta = stop_contrib - continue_contrib
-    base_expected_total = float(sales_made_unmasked_val + np.sum(continue_contrib, dtype=np.float64))
 
     threshold = np.inf
-    best_expected_total = base_expected_total
+    best_total_g = base_total_g
     if p_val.size > 0:
         order = np.argsort(-p_val, kind="mergesort")
         p_sorted = p_val[order]
         delta_sorted = delta[order]
         cum_delta = np.cumsum(delta_sorted, dtype=np.float64)
         group_ends = np.flatnonzero(np.r_[p_sorted[1:] != p_sorted[:-1], True])
-        candidate_totals = base_expected_total + cum_delta[group_ends]
+        candidate_totals = base_total_g + cum_delta[group_ends]
         best_idx = int(np.argmax(candidate_totals))
-        if candidate_totals[best_idx] > best_expected_total:
-            best_expected_total = float(candidate_totals[best_idx])
+        if candidate_totals[best_idx] > best_total_g:
+            best_total_g = float(candidate_totals[best_idx])
             threshold = float(p_sorted[group_ends[best_idx]])
 
-    expected_sales_gain_pct = 100.0 * (best_expected_total - status_quo_sales_val) / status_quo_sales_val
+    # Explicitly compute the induced stopping time tau^k(threshold) and sum g(tau^k, X_{tau^k}^k).
+    # This matches the "pick rho_n, induce tau, compute g(tau)" view.
+    tau_col_val = np.where(p_val >= threshold, stop_col, tau_cont_col_val)
+    best_total_g_direct = float(
+        np.sum(g_val_stop[~mask_val, -1], dtype=np.float64)
+        + np.sum(g_val_stop[mask_val, tau_col_val], dtype=np.float64)
+    )
+    assert np.allclose(best_total_g_direct, best_total_g)
+    best_total_g = best_total_g_direct
+
     threshold_str = "+inf" if np.isposinf(threshold) else f"{threshold:.6f}"
     print(
         f"  {label} tuned threshold on val={threshold_str} "
-        f"(expected sales gain={expected_sales_gain_pct:.4f}%)"
+        f"(val_total_g={best_total_g:.6f}, val_delta_g={best_total_g - base_total_g:.6f})"
     )
     return threshold
 # g_stop(n, X_n^k) = cumulative reward of stopping call k at time n given state X_n^k.
@@ -191,7 +208,6 @@ yhat_val[:, -1] = 1
 yhat_test[:, -1] = 1
 
 status_quo_sales = float(np.sum(is_sale_test))
-status_quo_sales_val = float(np.sum(is_sale_val))
 
 # -----------------------------
 # Base case: n = T - 1 (t=90)
@@ -268,21 +284,13 @@ p_train = clf.predict_proba(X_train)[:, 1]
 p_val = clf.predict_proba(X_val)[:, 1]
 p_test = clf.predict_proba(X_test)[:, 1]
 
-duration_val_masked = duration_val[mask_val].astype(np.float64, copy=False)
-is_sale_val_masked = is_sale_val[mask_val].astype(np.float64, copy=False)
-continue_terminal_val = np.ones(duration_val_masked.shape[0], dtype=bool)
-continue_stop_time_val = duration_val_masked.copy()
-threshold_t_minus_1 = _tune_threshold_on_val_expected_sales_gain(
+threshold_t_minus_1 = _tune_threshold_on_val_total_return(
     "T - 1",
     p_val,
-    duration_val_masked,
-    is_sale_val_masked,
-    n,
-    continue_stop_time_val,
-    continue_terminal_val,
-    SALE_RATE_PER_SECOND,
-    status_quo_sales_val,
-    float(np.sum(is_sale_val[~mask_val])),
+    g_val_stop,
+    yhat_val,
+    mask_val,
+    stop_col=-2,
 )
 
 yhat_train[mask_train, -2] = (p_train >= threshold_t_minus_1).astype(int)
@@ -403,23 +411,13 @@ p_train = clf.predict_proba(X_train)[:, 1]
 p_val = clf.predict_proba(X_val)[:, 1]
 p_test = clf.predict_proba(X_test)[:, 1]
 
-duration_val_masked = duration_val[mask_val].astype(np.float64, copy=False)
-is_sale_val_masked = is_sale_val[mask_val].astype(np.float64, copy=False)
-continue_first_col_val = first_col_val[mask_val]
-continue_terminal_val = continue_first_col_val == len(Ts)
-continue_stop_time_val = duration_val_masked.copy()
-continue_stop_time_val[~continue_terminal_val] = Ts_arr[continue_first_col_val[~continue_terminal_val]]
-threshold_t_minus_2 = _tune_threshold_on_val_expected_sales_gain(
+threshold_t_minus_2 = _tune_threshold_on_val_total_return(
     "T - 2",
     p_val,
-    duration_val_masked,
-    is_sale_val_masked,
-    n,
-    continue_stop_time_val,
-    continue_terminal_val,
-    SALE_RATE_PER_SECOND,
-    status_quo_sales_val,
-    float(np.sum(is_sale_val[~mask_val])),
+    g_val_stop,
+    yhat_val,
+    mask_val,
+    stop_col=-3,
 )
 
 yhat_train[mask_train, -3] = (p_train >= threshold_t_minus_2).astype(int)
@@ -551,23 +549,13 @@ p_train = clf.predict_proba(X_train)[:, 1]
 p_val = clf.predict_proba(X_val)[:, 1]
 p_test = clf.predict_proba(X_test)[:, 1]
 
-duration_val_masked = duration_val[mask_val].astype(np.float64, copy=False)
-is_sale_val_masked = is_sale_val[mask_val].astype(np.float64, copy=False)
-continue_first_col_val = first_col_val[mask_val]
-continue_terminal_val = continue_first_col_val == len(Ts)
-continue_stop_time_val = duration_val_masked.copy()
-continue_stop_time_val[~continue_terminal_val] = Ts_arr[continue_first_col_val[~continue_terminal_val]]
-threshold_t_minus_3 = _tune_threshold_on_val_expected_sales_gain(
+threshold_t_minus_3 = _tune_threshold_on_val_total_return(
     "T - 3",
     p_val,
-    duration_val_masked,
-    is_sale_val_masked,
-    n,
-    continue_stop_time_val,
-    continue_terminal_val,
-    SALE_RATE_PER_SECOND,
-    status_quo_sales_val,
-    float(np.sum(is_sale_val[~mask_val])),
+    g_val_stop,
+    yhat_val,
+    mask_val,
+    stop_col=-4,
 )
 
 yhat_train[mask_train, -4] = (p_train >= threshold_t_minus_3).astype(int)
