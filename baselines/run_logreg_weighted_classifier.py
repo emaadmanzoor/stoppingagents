@@ -19,10 +19,12 @@ SALE_RATE_PER_SECOND = SALE_RATE / AVERAGE_DURATION
 seed = int(os.environ.get("SEED", "42"))
 embedding_dim_max = int(os.environ.get("BC_DIM_IN", "1500000"))
 
-# LR config: dim_in=3072 solver=lbfgs C=20.0 max_iter=100000
+# LR config: dim_in=3072 solver=lbfgs C_T-1=4.64158883361 C_T-2=59.9484250319 C_T-3=35.938136638 max_iter=100000
 
 lr_solver = os.environ.get("LR_SOLVER", "lbfgs")
-lr_c = float(os.environ.get("LR_C", "20.0"))
+lr_c_T_minus_1 = float(os.environ.get("LR_C_T_MINUS_1", "4.64158883361"))
+lr_c_T_minus_2 = float(os.environ.get("LR_C_T_MINUS_2", "59.9484250319"))
+lr_c_T_minus_3 = float(os.environ.get("LR_C_T_MINUS_3", "35.938136638"))
 lr_max_iter = int(os.environ.get("LR_MAX_ITER", "100000"))
 
 assert os.path.exists(CALLS_H5_PATH)
@@ -119,7 +121,9 @@ assert embeddings_test.shape == (len(calls_test), d_in, len(Ts))
 
 print(
     "LR config: "
-    f"dim_in={d_in} solver={lr_solver} C={lr_c} max_iter={lr_max_iter}"
+    f"dim_in={d_in} solver={lr_solver} "
+    f"C_T-1={lr_c_T_minus_1} C_T-2={lr_c_T_minus_2} C_T-3={lr_c_T_minus_3} "
+    f"max_iter={lr_max_iter}"
 )
 
 
@@ -258,7 +262,7 @@ y_fit = y_train
 sample_weight_fit = sample_weight_train
 
 clf = LogisticRegression(
-    C=lr_c,
+    C=lr_c_T_minus_1,
     solver=lr_solver,
     tol=1e-24,
     max_iter=lr_max_iter,
@@ -369,7 +373,7 @@ y_fit = y_train
 sample_weight_fit = sample_weight_train
 
 clf = LogisticRegression(
-    C=lr_c,
+    C=lr_c_T_minus_2,
     solver=lr_solver,
     tol=1e-24,
     max_iter=lr_max_iter,
@@ -491,7 +495,7 @@ y_fit = y_train
 sample_weight_fit = sample_weight_train
 
 clf = LogisticRegression(
-    C=lr_c,
+    C=lr_c_T_minus_3,
     solver=lr_solver,
     tol=1e-24,
     max_iter=lr_max_iter,
